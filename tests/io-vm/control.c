@@ -53,6 +53,10 @@ int main(void)
     assert(queue_address(&b,0x40000001,4096,1,&address));
     assert(queue_address(&b,UINT64_MAX-7,16,8,&address));
     assert(queue_address(&b,0x3ffff000,16,16,&address));
+    struct backend idle = {.fd=-1, .notification=-1, .memory=MAP_FAILED};
+    struct hyper_io_activate activation = {0};
+    assert(activate(&idle, &activation, VERSION_1) == HYPER_IO_INVALID);
+    assert(idle.fd == -1 && !idle.bound && !idle.attached);
     puts("HypeR control protocol tests: PASS");
     return 0;
 }

@@ -102,3 +102,12 @@ Linux bridge modules in `modules/` are GPL-2.0-only; see
 [GPL-2.0](LICENSES/GPL-2.0-only.txt) and per-file SPDX headers. Linux and BusyBox
 retain their upstream licenses. Binary releases must carry matching source
 materials and notices; the combined appliance is not Apache-only.
+
+## Standby boot
+
+HypeR can boot `hyper.role=io hyper.mode=standby` with only assigned storage
+and a control mailbox. The service probes vhost-scsi and blocks on mailbox
+requests without allocating client RAM, notification bindings, or virtqueues.
+HELLO and RESET remain available; ACTIVATE is rejected while no client is
+provisioned. Live client attachment is not implemented by this mode. The
+existing attached deployment and disk acceptance remain unchanged.

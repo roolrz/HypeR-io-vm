@@ -72,6 +72,10 @@ static int activate(struct backend *b, const struct hyper_io_activate *message, 
 	};
 	struct hyper_io_eventfds bridge = { .epoch = le64toh(message->header.epoch) };
 	if (b->fd >= 0 || b->bound || b->attached) return HYPER_IO_BUSY;
+	/* Standby owns no client RAM or notification endpoint. Never configure
+	 * vhost until an explicitly provisioned client exists. */
+	if (b->memory == MAP_FAILED || !b->region.length || b->notification < 0)
+		return HYPER_IO_INVALID;
 	if (features != VERSION_1 || (features & ~offered) || !bridge.epoch)
 		return HYPER_IO_INVALID;
 	/* Validate every queue extent and all overlap before opening a backend. */
@@ -192,18 +196,22 @@ int main(int argc, char **argv)
 		.kick = {-1,-1,-1}, .call = {-1,-1,-1}, .memory = MAP_FAILED};
 	if (argc != 3 || strlen(argv[2]) >= sizeof(b.target.vhost_wwpn)) return 2;
 	memcpy(b.target.vhost_wwpn, argv[2], strlen(argv[2]) + 1);
-	b.memory_fd = open(argv[1], O_RDWR | O_CLOEXEC);
-	if (b.memory_fd < 0 || ioctl(b.memory_fd, HYPER_MEMORY_INFO, &b.region) ||
-	    !b.region.length || (uint64_t)(size_t)b.region.length != b.region.length) return 1;
-	b.memory = mmap(NULL, b.region.length, PROT_READ | PROT_WRITE, MAP_SHARED, b.memory_fd, 0);
-	b.notification = open("/dev/hyper-io-notification", O_RDWR | O_CLOEXEC);
+	int standby = !strcmp(argv[1], "--standby");
+	if (!standby) {
+		b.memory_fd = open(argv[1], O_RDWR | O_CLOEXEC);
+		if (b.memory_fd < 0 || ioctl(b.memory_fd, HYPER_MEMORY_INFO, &b.region) ||
+		    !b.region.length || (uint64_t)(size_t)b.region.length != b.region.length) return 1;
+		b.memory = mmap(NULL, b.region.length, PROT_READ | PROT_WRITE, MAP_SHARED, b.memory_fd, 0);
+		b.notification = open("/dev/hyper-io-notification", O_RDWR | O_CLOEXEC);
+		if (b.memory == MAP_FAILED || b.notification < 0) return 1;
+	}
 	int control = open("/dev/hyper-io-control", O_RDWR | O_CLOEXEC);
 	int probe = open("/dev/vhost-scsi", O_RDWR | O_CLOEXEC);
 	uint64_t features = 0;
-	if (b.memory == MAP_FAILED || b.notification < 0 || control < 0 || probe < 0 ||
+	if (control < 0 || probe < 0 ||
 	    ioctl(probe, VHOST_GET_FEATURES, &features) || !(features & VERSION_1)) return 1;
 	close(probe); features &= VERSION_1;
-	puts("HypeR I/O: backend service ready"); fflush(stdout);
+	puts(standby ? "HypeR I/O: standby service ready" : "HypeR I/O: backend service ready"); fflush(stdout);
 	int result = serve(&b, control, features);
 	if (quiesce(&b)) {
 		/* No successful acknowledgement or unmap is allowed after failed drain.
@@ -211,6 +219,9 @@ int main(int argc, char **argv)
 		fputs("HypeR I/O: quiescence failed; retaining backend\n", stderr);
 		for (;;) pause();
 	}
-	close(control); close(b.notification); munmap(b.memory, b.region.length); close(b.memory_fd);
+	close(control);
+	if (b.notification >= 0) close(b.notification);
+	if (b.memory != MAP_FAILED) munmap(b.memory, b.region.length);
+	if (b.memory_fd >= 0) close(b.memory_fd);
 	return result ? 1 : 0;
 }
