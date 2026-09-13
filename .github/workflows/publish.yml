@@ -1,0 +1,112 @@
+# SPDX-FileCopyrightText: 2026 roolrz
+# SPDX-License-Identifier: Apache-2.0
+name: Publish a qualified I/O appliance
+on:
+  workflow_call:
+    inputs:
+      qualified_run:
+        required: true
+        type: string
+      revision:
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+  packages: write
+concurrency:
+  group: publish-io-vm-${{ inputs.version }}
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Validate the explicitly qualified build identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QUALIFIED_RUN: ${{ inputs.qualified_run }}
+          SOURCE_REVISION: ${{ inputs.revision }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          python3 - <<'PYTHON'
+          import json, os, re, subprocess
+          run_id = os.environ['QUALIFIED_RUN']
+          revision = os.environ['SOURCE_REVISION']
+          version = os.environ['RELEASE_VERSION']
+          if not re.fullmatch(r'[0-9]+', run_id) or not re.fullmatch(r'[0-9a-f]{40}', revision):
+              raise ValueError('exact workflow run and source commit are required')
+          if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]*', version):
+              raise ValueError('invalid immutable release version')
+          run = json.loads(subprocess.check_output([
+              'gh', 'api', f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{run_id}"]))
+          if (run['conclusion'] != 'success' or run['head_sha'] != revision
+                  or run['path'] != '.github/workflows/kernel.yml'):
+              raise ValueError('qualified run must be a successful kernel build at the exact source revision')
+          print(f'Publishing explicitly qualified source {revision} from build {run_id}')
+          PYTHON
+      # Use the reviewed workflow verifier, not an older publisher from the
+      # selected binary source revision. Payload provenance is checked below.
+      - uses: actions/checkout@v4
+      - name: Download the exact immutable build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: aarch64-qemu-base
+          path: qualified
+          run-id: ${{ inputs.qualified_run }}
+          github-token: ${{ github.token }}
+      - name: Install pinned ORAS
+        uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6
+        with:
+          version: 1.3.0
+      - name: Authenticate publication without exposing credentials
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_USER: ${{ github.actor }}
+        run: printf '%s' "$GH_TOKEN" | oras login ghcr.io --username "$REGISTRY_USER" --password-stdin
+      - name: Publish the qualified binary and corresponding source generation
+        env:
+          SOURCE_REVISION: ${{ inputs.revision }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          python3 - <<'PYTHON'
+          import hashlib, json, os, re, subprocess
+          from pathlib import Path
+          root = Path('qualified')
+          boots = list(root.glob('boot/*/boot-artifacts.json'))
+          sources = list(root.glob('source-artifacts/*.tar.xz'))
+          if len(boots) != 1 or len(sources) != 1:
+              raise ValueError('one coherent boot and corresponding-source generation is required')
+          boot = boots[0].parent
+          manifest = json.loads(boots[0].read_text())
+          base = root / 'artifacts' / manifest['base_manifest_sha256']
+          with sources[0].open('rb') as source:
+              if hashlib.file_digest(source, 'sha256').hexdigest() != sources[0].name.removesuffix('.tar.xz'):
+                  raise ValueError('source archive identity differs from the qualified build')
+          reference = 'ghcr.io/roolrz/hyper-io-vm:' + os.environ['RELEASE_VERSION'] + '-aarch64-qemu'
+          # Never overwrite an already published version. A registry/auth error
+          # also fails closed; only an explicit missing manifest permits upload.
+          probe = subprocess.run(['oras', 'manifest', 'fetch', reference], capture_output=True, text=True)
+          if probe.returncode == 0:
+              raise ValueError('release version already exists')
+          if not any(reason in probe.stderr.lower() for reason in ('not found', 'manifest_unknown', 'name_unknown')):
+              raise RuntimeError(probe.stderr)
+          result = subprocess.run(['python3', '-B', 'tools/publish.py', '--boot', str(boot),
+              '--base', str(base), '--sources', str(sources[0]), '--revision', os.environ['SOURCE_REVISION'],
+              '--reference', reference], check=True, capture_output=True, text=True)
+          print(result.stdout)
+          digest = result.stdout.strip().splitlines()[-1]
+          if not re.fullmatch(r'ghcr.io/roolrz/hyper-io-vm@sha256:[0-9a-f]{64}', digest):
+              raise ValueError('publisher did not return an immutable reference')
+          Path('published-reference.txt').write_text(digest + '\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('Qualified appliance: `' + digest + '`\n')
+          PYTHON
+      - uses: actions/upload-artifact@v4
+        with:
+          name: published-reference
+          path: published-reference.txt
+          if-no-files-found: error

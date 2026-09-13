@@ -1,0 +1,61 @@
+// SPDX-FileCopyrightText: 2026 roolrz
+// SPDX-License-Identifier: Apache-2.0
+#ifndef HYPER_IO_H
+#define HYPER_IO_H
+#include <linux/types.h>
+#include <linux/ioctl.h>
+#define HYPER_IO_MAGIC 0x314f4948U
+#define HYPER_IO_VERSION 1
+#define HYPER_IO_RECORD 256
+#define HYPER_IO_REPLY 1
+#define HYPER_IO_HELLO 1
+#define HYPER_IO_ACTIVATE 2
+#define HYPER_IO_RESET 3
+#define HYPER_IO_STOP_QUEUE 4
+#define HYPER_IO_OK 0
+#define HYPER_IO_UNSUPPORTED 1
+#define HYPER_IO_INVALID 2
+#define HYPER_IO_BUSY 3
+#define HYPER_IO_BACKEND_FAILURE 4
+#define HYPER_IO_QUIESCENCE_FAILED 5
+struct hyper_io_header {
+	__le32 magic;
+	__le16 version, operation;
+	__le32 length, flags;
+	__le64 binding, epoch, transaction;
+};
+struct hyper_io_queue {
+	__le32 size, reserved;
+	__le64 descriptor, available, used;
+};
+struct hyper_io_activate {
+	struct hyper_io_header header;
+	__le64 features;
+	struct hyper_io_queue queues[3];
+};
+struct hyper_io_reply {
+	struct hyper_io_header header;
+	__le32 status, reserved;
+	__le64 features;
+	__le32 queues, queue_max;
+};
+/* Linux-local control ABI. File descriptor numbers never cross the VM boundary. */
+struct hyper_io_eventfds {
+	__u32 epoch, reserved;
+	__s32 kick[3], call[3];
+};
+struct hyper_memory_info {
+	__u64 guest_base, length;
+};
+/* Shared by the Linux wait loop and its deterministic delayed-IRQ test.
+ * A one-shot IRQ can mask a newer arm without making RX_READY true. */
+#define HYPER_IO_MAILBOX_CLOSED 4U
+static inline int hyper_io_wait_ready(__u32 status, __u32 wanted,
+                                     __u64 armed_generation, __u64 irq_generation)
+{
+	return (status & (wanted | HYPER_IO_MAILBOX_CLOSED)) || armed_generation != irq_generation;
+}
+#define HYPER_IO_BIND _IOW('H', 0x40, struct hyper_io_eventfds)
+#define HYPER_IO_UNBIND _IO('H', 0x41)
+#define HYPER_MEMORY_INFO _IOR('H', 0x42, struct hyper_memory_info)
+#endif

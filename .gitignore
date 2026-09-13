@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+/target/
+__pycache__/
+*.pyc

@@ -1,0 +1,16 @@
+{
+  "SPDX-FileCopyrightText": "2026 roolrz",
+  "SPDX-License-Identifier": "Apache-2.0",
+  "format": 1,
+  "linux": {
+    "version": "6.18.51",
+    "series": "6.18",
+    "url": "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.51.tar.xz",
+    "sha256": "ba2f60f858bf4d1f929101faa356c93dc8b925b17aaa9f95eabd4627758df613"
+  },
+  "busybox": {
+    "version": "1.37.0",
+    "url": "https://busybox.net/downloads/busybox-1.37.0.tar.bz2",
+    "sha256": "3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b837043a4"
+  }
+}

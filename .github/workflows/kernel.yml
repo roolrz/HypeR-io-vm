@@ -1,0 +1,115 @@
+# SPDX-FileCopyrightText: 2026 roolrz
+# SPDX-License-Identifier: Apache-2.0
+name: Upstream kernel and real-disk acceptance
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Build, or publish an explicitly qualified build after cross-VM review
+        type: choice
+        options: [build, publish]
+        default: build
+      qualified_run:
+        description: Successful kernel build run ID, required only for publication
+        type: string
+      revision:
+        description: Exact qualified source commit, required only for publication
+        type: string
+      version:
+        description: Immutable prerelease version, required only for publication
+        type: string
+permissions:
+  contents: read
+jobs:
+  qemu-disk:
+    if: inputs.operation != 'publish'
+    name: AArch64 upstream Linux, module, and vhost-scsi disk
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore pinned upstream build cache
+        id: upstream-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            target/io-vm/downloads/
+            target/io-vm/sources/
+            target/io-vm/build/
+          key: upstream-aarch64-ubuntu24-${{ hashFiles('sources.lock.json', 'configs/*') }}-${{ github.run_id }}
+          restore-keys: |
+            upstream-aarch64-ubuntu24-${{ hashFiles('sources.lock.json', 'configs/*') }}-
+      - name: Install cross compiler and QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross bison flex bc libssl-dev libelf-dev kmod qemu-system-arm device-tree-compiler
+      - name: Check control protocol and queue boundaries
+        run: |
+          gcc -O2 -Wall -Wextra -Werror -Iinclude tests/io-vm/control.c -o /tmp/hyper-control-test
+          /tmp/hyper-control-test
+      - name: Build the pinned upstream kernel, BusyBox, and external module
+        run: make base CROSS_COMPILE=aarch64-linux-gnu- JOBS=4
+      - name: Boot the complete business appliance
+        run: |
+          python3 - <<'PYTHON'
+          import json
+          import subprocess
+          from pathlib import Path
+          boot = json.loads(Path('target/io-vm/qemu-boot.json').read_text())
+          subprocess.run(['python3', '-B', 'tests/io-vm/business.py', '--boot', boot['directory'],
+                          '--log', 'target/io-vm/business.log', '--reset'], check=True)
+          PYTHON
+      - name: Compile the AArch64 disk fixture
+        run: aarch64-linux-gnu-gcc -static -O2 -Wall -Wextra -Werror tests/io-vm/vhost-scsi.c -o target/io-vm/vhost-scsi-test
+      - name: Verify vhost-scsi writes against the QEMU disk image
+        run: |
+          python3 - <<'PYTHON'
+          import json
+          import subprocess
+          from pathlib import Path
+          base = json.loads(Path('target/io-vm/qemu-base.json').read_text())
+          subprocess.run(['python3', '-B', 'tests/io-vm/verify.py',
+                          '--base', base['directory'],
+                          '--manifest-sha256', base['manifest_sha256'],
+                          '--test-binary', 'target/io-vm/vhost-scsi-test'], check=True)
+          PYTHON
+      - name: Save incremental upstream build cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            target/io-vm/downloads/
+            target/io-vm/sources/
+            target/io-vm/build/
+          key: ${{ steps.upstream-cache.outputs.cache-primary-key }}
+      - name: Retain the acceptance log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-disk-acceptance-log
+          path: |
+            target/io-vm/acceptance.log
+            target/io-vm/business.log
+          if-no-files-found: ignore
+      - name: Retain verified build inputs for Hyper integration
+        uses: actions/upload-artifact@v4
+        with:
+          name: aarch64-qemu-base
+          path: |
+            target/io-vm/artifacts/
+            target/io-vm/boot/
+            target/io-vm/source-artifacts/
+            target/io-vm/vhost-scsi-test
+          if-no-files-found: error
+          retention-days: 7
+  publish-qualified:
+    if: inputs.operation == 'publish'
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+    uses: ./.github/workflows/publish.yml
+    with:
+      qualified_run: ${{ inputs.qualified_run }}
+      revision: ${{ inputs.revision }}
+      version: ${{ inputs.version }}

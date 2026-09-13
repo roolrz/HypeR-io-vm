@@ -1,0 +1,216 @@
+// SPDX-FileCopyrightText: 2026 roolrz
+// SPDX-License-Identifier: Apache-2.0
+#define _GNU_SOURCE
+#include <endian.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/vhost.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/eventfd.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include "hyper_io.h"
+
+#define VERSION_1 (UINT64_C(1) << 32)
+_Static_assert(sizeof(struct hyper_io_header) == 40, "bridge header layout");
+_Static_assert(sizeof(struct hyper_io_activate) == 144, "activation layout");
+_Static_assert(sizeof(struct hyper_io_reply) == 64, "reply layout");
+struct backend {
+	int notification, memory_fd, fd;
+	int kick[3], call[3];
+	void *memory;
+	struct hyper_memory_info region;
+	struct vhost_scsi_target target;
+	int attached, bound;
+};
+static int quiesce(struct backend *b)
+{
+	/* CLEAR_ENDPOINT clears all queue backends and flushes in-flight commands.
+	 * Never replace this with KICK=-1 or GET_VRING_BASE: neither drains SCSI. */
+	if (b->attached) {
+		if (ioctl(b->fd, VHOST_SCSI_CLEAR_ENDPOINT, &b->target))
+			return -1;
+		b->attached = 0;
+	}
+	if (b->fd >= 0) {
+		close(b->fd);
+		b->fd = -1;
+	}
+	/* All vhost producers are gone before callbacks and their epoch disappear. */
+	if (b->bound) {
+		if (ioctl(b->notification, HYPER_IO_UNBIND))
+			return -1;
+		b->bound = 0;
+	}
+	for (unsigned int i = 0; i < 3; ++i) {
+		if (b->kick[i] >= 0) close(b->kick[i]);
+		if (b->call[i] >= 0) close(b->call[i]);
+		b->kick[i] = b->call[i] = -1;
+	}
+	return 0;
+}
+static int queue_address(struct backend *b, uint64_t gpa, uint64_t bytes,
+			 uint64_t alignment, uint64_t *result)
+{
+	if (gpa < b->region.guest_base || gpa % alignment ||
+	    bytes > b->region.length || gpa - b->region.guest_base > b->region.length - bytes)
+		return -1;
+	*result = (uintptr_t)b->memory + (gpa - b->region.guest_base);
+	return 0;
+}
+static int activate(struct backend *b, const struct hyper_io_activate *message, uint64_t offered)
+{
+	uint64_t features = le64toh(message->features);
+	struct { struct vhost_memory header; struct vhost_memory_region region; } table = {
+		.header = { .nregions = 1 },
+		.region = { .guest_phys_addr = b->region.guest_base,
+			.memory_size = b->region.length, .userspace_addr = (uintptr_t)b->memory },
+	};
+	struct hyper_io_eventfds bridge = { .epoch = le64toh(message->header.epoch) };
+	if (b->fd >= 0 || b->bound || b->attached) return HYPER_IO_BUSY;
+	if (features != VERSION_1 || (features & ~offered) || !bridge.epoch)
+		return HYPER_IO_INVALID;
+	/* Validate every queue extent and all overlap before opening a backend. */
+	uint64_t starts[9], ends[9];
+	for (unsigned int i = 0; i < 3; ++i) {
+		uint32_t size = le32toh(message->queues[i].size);
+		uint64_t addresses[3] = {le64toh(message->queues[i].descriptor),
+			le64toh(message->queues[i].available), le64toh(message->queues[i].used)};
+		uint64_t lengths[3] = {16ULL * size, 6 + 2ULL * size, 6 + 8ULL * size};
+		const unsigned int alignments[3] = {16, 2, 4};
+		if (!size || size > 128 || (size & (size - 1)) || message->queues[i].reserved)
+			return HYPER_IO_INVALID;
+		for (unsigned int part = 0; part < 3; ++part) {
+			unsigned int index = i * 3 + part;
+			if (queue_address(b, addresses[part], lengths[part], alignments[part], &starts[index]))
+				return HYPER_IO_INVALID;
+			ends[index] = starts[index] + lengths[part];
+			for (unsigned int old = 0; old < index; ++old)
+				if (starts[index] < ends[old] && starts[old] < ends[index])
+					return HYPER_IO_INVALID;
+		}
+	}
+	b->fd = open("/dev/vhost-scsi", O_RDWR | O_CLOEXEC);
+	if (b->fd < 0 || ioctl(b->fd, VHOST_SET_OWNER, NULL) ||
+	    ioctl(b->fd, VHOST_SET_FEATURES, &features) || ioctl(b->fd, VHOST_SET_MEM_TABLE, &table))
+		goto fail;
+	for (unsigned int i = 0; i < 3; ++i) {
+		struct vhost_vring_state state = {.index = i, .num = le32toh(message->queues[i].size)};
+		struct vhost_vring_addr address = {.index = i, .desc_user_addr = starts[i * 3],
+			.avail_user_addr = starts[i * 3 + 1], .used_user_addr = starts[i * 3 + 2]};
+		struct vhost_vring_file event = {.index = i};
+		if (ioctl(b->fd, VHOST_SET_VRING_NUM, &state) ||
+		    ioctl(b->fd, VHOST_SET_VRING_ADDR, &address)) goto fail;
+		state.num = 0;
+		if (ioctl(b->fd, VHOST_SET_VRING_BASE, &state)) goto fail;
+		b->kick[i] = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+		b->call[i] = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+		if (b->kick[i] < 0 || b->call[i] < 0) goto fail;
+		event.fd = b->kick[i];
+		if (ioctl(b->fd, VHOST_SET_VRING_KICK, &event)) goto fail;
+		event.fd = b->call[i];
+		if (ioctl(b->fd, VHOST_SET_VRING_CALL, &event)) goto fail;
+		bridge.kick[i] = b->kick[i]; bridge.call[i] = b->call[i];
+	}
+	if (ioctl(b->notification, HYPER_IO_BIND, &bridge)) goto fail;
+	b->bound = 1;
+	if (ioctl(b->fd, VHOST_SCSI_SET_ENDPOINT, &b->target)) goto fail;
+	b->attached = 1;
+	return HYPER_IO_OK;
+fail:
+	fprintf(stderr, "HypeR I/O: activation failed: %s\n", strerror(errno));
+	return quiesce(b) ? HYPER_IO_QUIESCENCE_FAILED : HYPER_IO_BACKEND_FAILURE;
+}
+static int serve(struct backend *b, int control, uint64_t features)
+{
+	unsigned char message[256], previous[256];
+	struct hyper_io_reply response = {0}, previous_reply = {0};
+	uint64_t binding = 0, last_transaction = 0;
+	size_t previous_size = 0, reply_size = 0;
+	for (;;) {
+		ssize_t size;
+		do { size = read(control, message, sizeof(message)); } while (size < 0 && errno == EINTR);
+		/* Peer close is administrative shutdown; main still drains before exit. */
+		if (size < 0 && errno == EPIPE) return 0;
+		if (size <= 0) return -1;
+		if (size < (ssize_t)sizeof(struct hyper_io_header)) return -1;
+		struct hyper_io_header header;
+		memcpy(&header, message, sizeof(header));
+		uint64_t request_binding = le64toh(header.binding), transaction = le64toh(header.transaction);
+		if (!le64toh(header.epoch)) return -1;
+		if (le32toh(header.magic) != HYPER_IO_MAGIC || le16toh(header.version) != 1 ||
+		    le32toh(header.length) != (uint32_t)size || header.flags || !request_binding || !transaction ||
+		    le64toh(header.epoch) > UINT32_MAX) return -1;
+		if (transaction == last_transaction && (size_t)size == previous_size &&
+		    !memcmp(previous, message, previous_size)) {
+			/* Same transaction is replay-only, including failures. Retrying a
+			 * failed drain requires a fresh transaction and RESET. */
+			response = previous_reply;
+		} else {
+			uint32_t status = HYPER_IO_INVALID;
+			uint16_t operation = le16toh(header.operation);
+			memset(&response, 0, sizeof(response)); response.header = header;
+			reply_size = 48;
+			if ((!binding || binding == request_binding) && transaction > last_transaction) {
+				if (operation == HYPER_IO_HELLO && size == 40) {
+					binding = request_binding; status = HYPER_IO_OK; reply_size = 64;
+					response.features = htole64(features);
+					response.queues = htole32(3); response.queue_max = htole32(128);
+				} else if (binding && operation == HYPER_IO_ACTIVATE && size == 144) {
+					struct hyper_io_activate request; memcpy(&request, message, sizeof(request));
+					status = activate(b, &request, features);
+				} else if (binding && ((operation == HYPER_IO_RESET && size == 40) ||
+				           (operation == HYPER_IO_STOP_QUEUE && size == 48))) {
+					uint32_t queue = 0, reserved = 0;
+					if (size == 48) { memcpy(&queue, message + 40, 4); memcpy(&reserved, message + 44, 4); }
+					if (le32toh(queue) < 3 && !reserved)
+						status = quiesce(b) ? HYPER_IO_QUIESCENCE_FAILED : HYPER_IO_OK;
+				}
+			}
+			response.header.length = htole32(reply_size); response.header.flags = htole32(HYPER_IO_REPLY);
+			response.status = htole32(status);
+			if (transaction > last_transaction) {
+				last_transaction = transaction; previous_size = size;
+				memcpy(previous, message, size); previous_reply = response;
+			}
+		}
+		ssize_t written;
+		do { written = write(control, &response, le32toh(response.header.length)); }
+		while (written < 0 && errno == EINTR);
+		if (written < 0 && errno == EPIPE) return 0;
+		if (written != (ssize_t)le32toh(response.header.length))
+			return -1;
+	}
+}
+int main(int argc, char **argv)
+{
+	struct backend b = {.notification = -1, .memory_fd = -1, .fd = -1,
+		.kick = {-1,-1,-1}, .call = {-1,-1,-1}, .memory = MAP_FAILED};
+	if (argc != 3 || strlen(argv[2]) >= sizeof(b.target.vhost_wwpn)) return 2;
+	memcpy(b.target.vhost_wwpn, argv[2], strlen(argv[2]) + 1);
+	b.memory_fd = open(argv[1], O_RDWR | O_CLOEXEC);
+	if (b.memory_fd < 0 || ioctl(b.memory_fd, HYPER_MEMORY_INFO, &b.region) ||
+	    !b.region.length || (uint64_t)(size_t)b.region.length != b.region.length) return 1;
+	b.memory = mmap(NULL, b.region.length, PROT_READ | PROT_WRITE, MAP_SHARED, b.memory_fd, 0);
+	b.notification = open("/dev/hyper-io-notification", O_RDWR | O_CLOEXEC);
+	int control = open("/dev/hyper-io-control", O_RDWR | O_CLOEXEC);
+	int probe = open("/dev/vhost-scsi", O_RDWR | O_CLOEXEC);
+	uint64_t features = 0;
+	if (b.memory == MAP_FAILED || b.notification < 0 || control < 0 || probe < 0 ||
+	    ioctl(probe, VHOST_GET_FEATURES, &features) || !(features & VERSION_1)) return 1;
+	close(probe); features &= VERSION_1;
+	puts("HypeR I/O: backend service ready"); fflush(stdout);
+	int result = serve(&b, control, features);
+	if (quiesce(&b)) {
+		/* No successful acknowledgement or unmap is allowed after failed drain.
+		 * Keep the process and all resources alive for host-side quarantine. */
+		fputs("HypeR I/O: quiescence failed; retaining backend\n", stderr);
+		for (;;) pause();
+	}
+	close(control); close(b.notification); munmap(b.memory, b.region.length); close(b.memory_fd);
+	return result ? 1 : 0;
+}

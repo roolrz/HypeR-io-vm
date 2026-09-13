@@ -1,0 +1,27 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: 2026 roolrz
+# SPDX-License-Identifier: Apache-2.0
+
+# Only used with the test harness's newly created disposable SCSI disk.
+set -eu
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mount -t configfs configfs /sys/kernel/config
+/usr/bin/vhost-scsi-test --load-module "/lib/modules/$(uname -r)/hyper_guest_memory.ko"
+
+core=/sys/kernel/config/target/core/iblock_0/hyper-test
+target=/sys/kernel/config/target/vhost/naa.5001405000000001
+mkdir -p "$core"
+echo udev_path=/dev/sda > "$core/control"
+echo 1 > "$core/enable"
+mkdir -p "$target/tpgt_1/lun/lun_0"
+echo naa.5001405000000002 > "$target/tpgt_1/nexus"
+ln -s "$core" "$target/tpgt_1/lun/lun_0/disk"
+
+set -- /dev/hyper-memory-*
+test "$#" -eq 1
+/usr/bin/vhost-scsi-test "$1" naa.5001405000000001
+echo 'HypeR I/O: acceptance complete'
+poweroff -f

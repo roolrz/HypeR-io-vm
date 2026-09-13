@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: 2026 roolrz
+# SPDX-License-Identifier: Apache-2.0
+name: I/O VM source checks
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source-checks:
+    name: Archive and publication contracts
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Python tools and package contracts
+        run: |
+          make test
+          python3 -B tools/build.py --help
+          python3 -B tools/publish.py --help
+          python3 -B tests/io-vm/verify.py --help
+      - name: Compile the Linux vhost-scsi acceptance fixture
+        run: cc -static -O2 -Wall -Wextra -Werror tests/io-vm/vhost-scsi.c -o /tmp/vhost-scsi-test
