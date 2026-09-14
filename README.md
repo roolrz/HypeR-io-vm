@@ -22,7 +22,11 @@ make test
 ```
 
 Non-AArch64 builders set `CROSS_COMPILE=aarch64-linux-gnu-`.
-`PLATFORM=rpi5` selects the board driver configuration; physical board and DMA
+The common AArch64 Image includes QEMU and upstream BCM2712 SDIO dependencies;
+HypeR selects devices with its board DT. The OCI supported-platforms annotation
+is derived from the verified resolved kernel configuration. It describes binary
+capabilities, not Pi hardware qualification. `PLATFORM=rpi5` remains an optional
+build profile; physical board and DMA
 qualification remain separate. Downloaded sources and outputs stay in `target/`.
 See [architecture and validation](ARCHITECTURE.md) for the image contract and
 reserved-page vhost-scsi acceptance test.

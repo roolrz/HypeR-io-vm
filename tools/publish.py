@@ -23,12 +23,33 @@ SPEC.loader.exec_module(ARCHIVE)
 
 REQUIRED_SOURCES = {
     'Makefile', 'tools/build.py', 'scripts/assemble-io-vm.py', 'rootfs/init',
-    'include/hyper_io.h', 'modules/guest-memory/Makefile',
+    'include/hyper_io.h', 'include/hyper_io_layout.h', 'include/hyper_io_session.h',
+    'service/hyper-volumes.c', 'service/hyper-io-supervisor.c', 'modules/guest-memory/Makefile',
     'modules/guest-memory/hyper_guest_memory.c', 'modules/io-bridge/Makefile',
     'modules/io-bridge/hyper_io_bridge.c', 'service/hyper-io-service.c',
     'tests/io-vm/business-disk.c', 'sources.lock.json',
     'configs/linux-aarch64.config', 'configs/busybox.config', 'LICENSE', 'LICENSES/GPL-2.0-only.txt',
 }
+
+
+# Capability metadata describes the same DT-selected binary, not hardware
+# qualification. A Pi deployment remains unqualified until physical acceptance.
+PI_BUILTINS = (
+    'ARM64', 'ARCH_BCM', 'ARCH_BCM2835', 'COMMON_CLK', 'PINCTRL',
+    'PINCTRL_BRCMSTB', 'PINCTRL_BCM2712', 'GPIOLIB', 'OF_GPIO', 'GPIO_BRCMSTB',
+    'REGULATOR', 'REGULATOR_FIXED_VOLTAGE', 'REGULATOR_GPIO', 'MMC', 'MMC_BLOCK',
+    'MMC_SDHCI', 'MMC_SDHCI_PLTFM', 'MMC_SDHCI_BRCMSTB', 'MMC_CQHCI',
+)
+
+
+def supported_platforms(metadata, config):
+    values = dict(line.split('=', 1) for line in config.decode().splitlines()
+                  if line.startswith('CONFIG_') and '=' in line)
+    result = [metadata['platform']]
+    if metadata['platform'] == 'qemu' and all(values.get('CONFIG_' + name) == 'y'
+                                            for name in PI_BUILTINS):
+        result.append('rpi5')
+    return result
 
 
 def verify_sources(sources, metadata, revision):
@@ -37,7 +58,7 @@ def verify_sources(sources, metadata, revision):
     hashes = metadata.get('source_files', {})
     if not REQUIRED_SOURCES <= hashes.keys():
         raise ValueError('build manifest lacks required source identities')
-    module_paths = ['include/hyper_io.h', 'modules/guest-memory/Makefile',
+    module_paths = ['include/hyper_io.h', 'include/hyper_io_layout.h', 'modules/guest-memory/Makefile',
                     'modules/guest-memory/hyper_guest_memory.c', 'modules/io-bridge/Makefile',
                     'modules/io-bridge/hyper_io_bridge.c']
     module_identity = hashlib.sha256(''.join(hashes[name] for name in module_paths).encode()).hexdigest()
@@ -156,6 +177,9 @@ def main():
         command = [args.oras, 'push', '--artifact-type', 'application/vnd.hyper.io-vm.v1',
                    '--annotation', 'org.hyper.architecture=aarch64',
                    '--annotation', 'org.hyper.platform=' + metadata['platform'],
+                   '--annotation', 'org.hyper.supported-platforms=' + json.dumps(
+                       supported_platforms(metadata, (staging / 'kernel.config').read_bytes()),
+                       separators=(',', ':')),
                    '--annotation', 'org.hyper.kernel.release=' + metadata['kernel_release'],
                    '--annotation', 'org.opencontainers.image.revision=' + args.revision,
                    '--annotation', 'org.opencontainers.image.source=https://github.com/roolrz/HypeR-io-vm',
