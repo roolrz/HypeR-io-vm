@@ -12,6 +12,8 @@
 #define HYPER_IO_ACTIVATE 2
 #define HYPER_IO_RESET 3
 #define HYPER_IO_STOP_QUEUE 4
+#define HYPER_IO_PREPARE_MEMORY 5
+#define HYPER_IO_RELEASE_MEMORY 6
 #define HYPER_IO_OK 0
 #define HYPER_IO_UNSUPPORTED 1
 #define HYPER_IO_INVALID 2
@@ -32,6 +34,10 @@ struct hyper_io_activate {
 	struct hyper_io_header header;
 	__le64 features;
 	struct hyper_io_queue queues[3];
+};
+struct hyper_io_prepare_memory {
+	struct hyper_io_header header;
+	__le64 guest_base, length;
 };
 struct hyper_io_reply {
 	struct hyper_io_header header;

@@ -6,6 +6,8 @@
 #include <fcntl.h>
 #include <linux/vhost.h>
 #include <stdint.h>
+#include <signal.h>
+#include <sys/wait.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,11 +16,15 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include "hyper_io.h"
+#include "hyper_io_session.h"
 
 #define VERSION_1 (UINT64_C(1) << 32)
 _Static_assert(sizeof(struct hyper_io_header) == 40, "bridge header layout");
 _Static_assert(sizeof(struct hyper_io_activate) == 144, "activation layout");
 _Static_assert(sizeof(struct hyper_io_reply) == 64, "reply layout");
+_Static_assert(sizeof(struct hyper_io_prepare_memory) == 56, "prepare layout");
+static volatile sig_atomic_t stopping;
+static void stop_signal(int signal) { (void)signal; stopping = 1; }
 struct backend {
 	int notification, memory_fd, fd;
 	int kick[3], call[3];
@@ -26,6 +32,8 @@ struct backend {
 	struct hyper_memory_info region;
 	struct vhost_scsi_target target;
 	int attached, bound;
+	int managed;
+	const char *memory_path;
 };
 static int quiesce(struct backend *b)
 {
@@ -52,6 +60,37 @@ static int quiesce(struct backend *b)
 		b->kick[i] = b->call[i] = -1;
 	}
 	return 0;
+}
+static int release_memory(struct backend *b)
+{
+	if (quiesce(b)) return HYPER_IO_QUIESCENCE_FAILED;
+	if (b->memory != MAP_FAILED) {
+		if (munmap(b->memory, b->region.length)) return HYPER_IO_QUIESCENCE_FAILED;
+		b->memory = MAP_FAILED;
+	}
+	if (b->memory_fd >= 0) { close(b->memory_fd); b->memory_fd = -1; }
+	memset(&b->region, 0, sizeof(b->region));
+	return HYPER_IO_OK;
+}
+static int prepare_memory(struct backend *b, const struct hyper_io_prepare_memory *request)
+{
+	uint64_t base = le64toh(request->guest_base), length = le64toh(request->length);
+	struct hyper_memory_info window;
+	if (!b->managed || b->memory != MAP_FAILED || b->memory_fd >= 0) return HYPER_IO_BUSY;
+	if (!length || length % 4096 || base % 4096 || base > UINT64_MAX - length ||
+	    (uint64_t)(size_t)length != length) return HYPER_IO_INVALID;
+	int fd = open(b->memory_path, O_RDWR | O_CLOEXEC);
+	if (fd < 0) return HYPER_IO_BACKEND_FAILURE;
+	if (ioctl(fd, HYPER_MEMORY_INFO, &window) || length > window.length) {
+		close(fd); return HYPER_IO_INVALID;
+	}
+	/* Host has already installed precisely this extent in the alias window.
+	 * The unused address-space reservation is never mapped or touched here. */
+	void *memory = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (memory == MAP_FAILED) { close(fd); return HYPER_IO_BACKEND_FAILURE; }
+	b->memory = memory; b->memory_fd = fd;
+	b->region.guest_base = base; b->region.length = length;
+	return HYPER_IO_OK;
 }
 static int queue_address(struct backend *b, uint64_t gpa, uint64_t bytes,
 			 uint64_t alignment, uint64_t *result)
@@ -133,11 +172,14 @@ static int serve(struct backend *b, int control, uint64_t features)
 {
 	unsigned char message[256], previous[256];
 	struct hyper_io_reply response = {0}, previous_reply = {0};
-	uint64_t binding = 0, last_transaction = 0;
+	struct hyper_io_session session = {0};
+	uint64_t last_transaction = 0;
 	size_t previous_size = 0, reply_size = 0;
 	for (;;) {
 		ssize_t size;
-		do { size = read(control, message, sizeof(message)); } while (size < 0 && errno == EINTR);
+		if (stopping) return 0;
+		do { size = read(control, message, sizeof(message)); } while (size < 0 && errno == EINTR && !stopping);
+		if (stopping) return 0;
 		/* Peer close is administrative shutdown; main still drains before exit. */
 		if (size < 0 && errno == EPIPE) return 0;
 		if (size <= 0) return -1;
@@ -149,25 +191,35 @@ static int serve(struct backend *b, int control, uint64_t features)
 		if (le32toh(header.magic) != HYPER_IO_MAGIC || le16toh(header.version) != 1 ||
 		    le32toh(header.length) != (uint32_t)size || header.flags || !request_binding || !transaction ||
 		    le64toh(header.epoch) > UINT32_MAX) return -1;
-		if (transaction == last_transaction && (size_t)size == previous_size &&
+		uint16_t operation = le16toh(header.operation);
+		int admission = hyper_io_session_admit(&session, request_binding, le64toh(header.epoch),
+			operation == HYPER_IO_HELLO && size == 40,
+			b->managed ? b->memory == MAP_FAILED : !session.binding);
+		if (admission > 0) { last_transaction = 0; previous_size = 0; }
+		if (admission >= 0 && transaction == last_transaction && (size_t)size == previous_size &&
 		    !memcmp(previous, message, previous_size)) {
 			/* Same transaction is replay-only, including failures. Retrying a
 			 * failed drain requires a fresh transaction and RESET. */
 			response = previous_reply;
 		} else {
 			uint32_t status = HYPER_IO_INVALID;
-			uint16_t operation = le16toh(header.operation);
 			memset(&response, 0, sizeof(response)); response.header = header;
 			reply_size = 48;
-			if ((!binding || binding == request_binding) && transaction > last_transaction) {
-				if (operation == HYPER_IO_HELLO && size == 40) {
-					binding = request_binding; status = HYPER_IO_OK; reply_size = 64;
+			if (admission >= 0 && transaction > last_transaction) {
+				if (operation == HYPER_IO_HELLO && size == 40 && hyper_io_session_preparable(&session)) {
+					status = HYPER_IO_OK; reply_size = 64;
 					response.features = htole64(features);
 					response.queues = htole32(3); response.queue_max = htole32(128);
-				} else if (binding && operation == HYPER_IO_ACTIVATE && size == 144) {
+				} else if (operation == HYPER_IO_PREPARE_MEMORY && size == 56 && b->managed && hyper_io_session_preparable(&session)) {
+					struct hyper_io_prepare_memory request; memcpy(&request, message, sizeof(request));
+					status = prepare_memory(b, &request);
+				} else if (operation == HYPER_IO_RELEASE_MEMORY && size == 40 && b->managed) {
+					status = release_memory(b);
+					if (status == HYPER_IO_OK) hyper_io_session_retire(&session);
+				} else if (operation == HYPER_IO_ACTIVATE && size == 144) {
 					struct hyper_io_activate request; memcpy(&request, message, sizeof(request));
 					status = activate(b, &request, features);
-				} else if (binding && ((operation == HYPER_IO_RESET && size == 40) ||
+				} else if (((operation == HYPER_IO_RESET && size == 40) ||
 				           (operation == HYPER_IO_STOP_QUEUE && size == 48))) {
 					uint32_t queue = 0, reserved = 0;
 					if (size == 48) { memcpy(&queue, message + 40, 4); memcpy(&reserved, message + 44, 4); }
@@ -177,14 +229,16 @@ static int serve(struct backend *b, int control, uint64_t features)
 			}
 			response.header.length = htole32(reply_size); response.header.flags = htole32(HYPER_IO_REPLY);
 			response.status = htole32(status);
-			if (transaction > last_transaction) {
+			if (admission >= 0 && transaction > last_transaction) {
+				if (le64toh(header.epoch) > session.epoch) session.epoch = le64toh(header.epoch);
 				last_transaction = transaction; previous_size = size;
 				memcpy(previous, message, size); previous_reply = response;
 			}
 		}
 		ssize_t written;
 		do { written = write(control, &response, le32toh(response.header.length)); }
-		while (written < 0 && errno == EINTR);
+		while (written < 0 && errno == EINTR && !stopping);
+		if (stopping) return 0;
 		if (written < 0 && errno == EPIPE) return 0;
 		if (written != (ssize_t)le32toh(response.header.length))
 			return -1;
@@ -194,10 +248,14 @@ int main(int argc, char **argv)
 {
 	struct backend b = {.notification = -1, .memory_fd = -1, .fd = -1,
 		.kick = {-1,-1,-1}, .call = {-1,-1,-1}, .memory = MAP_FAILED};
-	if (argc != 3 || strlen(argv[2]) >= sizeof(b.target.vhost_wwpn)) return 2;
+	if ((argc != 3 && argc != 5) || strlen(argv[2]) >= sizeof(b.target.vhost_wwpn)) return 2;
+	b.managed = argc == 5; b.memory_path = argv[1];
+	struct sigaction action = {.sa_handler = stop_signal};
+	sigemptyset(&action.sa_mask);
+	if (sigaction(SIGTERM, &action, NULL) || sigaction(SIGINT, &action, NULL)) return 1;
 	memcpy(b.target.vhost_wwpn, argv[2], strlen(argv[2]) + 1);
 	int standby = !strcmp(argv[1], "--standby");
-	if (!standby) {
+	if (!standby && !b.managed) {
 		b.memory_fd = open(argv[1], O_RDWR | O_CLOEXEC);
 		if (b.memory_fd < 0 || ioctl(b.memory_fd, HYPER_MEMORY_INFO, &b.region) ||
 		    !b.region.length || (uint64_t)(size_t)b.region.length != b.region.length) return 1;
@@ -205,7 +263,9 @@ int main(int argc, char **argv)
 		b.notification = open("/dev/hyper-io-notification", O_RDWR | O_CLOEXEC);
 		if (b.memory == MAP_FAILED || b.notification < 0) return 1;
 	}
-	int control = open("/dev/hyper-io-control", O_RDWR | O_CLOEXEC);
+	if (b.managed) b.notification = open(argv[4], O_RDWR | O_CLOEXEC);
+	if (b.managed && b.notification < 0) return 1;
+	int control = open(b.managed ? argv[3] : "/dev/hyper-io-control", O_RDWR | O_CLOEXEC);
 	int probe = open("/dev/vhost-scsi", O_RDWR | O_CLOEXEC);
 	uint64_t features = 0;
 	if (control < 0 || probe < 0 ||
@@ -213,7 +273,7 @@ int main(int argc, char **argv)
 	close(probe); features &= VERSION_1;
 	puts(standby ? "HypeR I/O: standby service ready" : "HypeR I/O: backend service ready"); fflush(stdout);
 	int result = serve(&b, control, features);
-	if (quiesce(&b)) {
+	if (release_memory(&b) != HYPER_IO_OK) {
 		/* No successful acknowledgement or unmap is allowed after failed drain.
 		 * Keep the process and all resources alive for host-side quarantine. */
 		fputs("HypeR I/O: quiescence failed; retaining backend\n", stderr);

@@ -167,7 +167,9 @@ static irqreturn_t bridge_irq(int irq, void *opaque)
 }
 static void bridge_destroy(struct kref *ref)
 {
-	kfree(container_of(ref, struct bridge, references));
+	struct bridge *bridge = container_of(ref, struct bridge, references);
+	kfree(bridge->misc.name);
+	kfree(bridge);
 }
 static int bridge_open(struct inode *inode, struct file *file)
 {
@@ -293,13 +295,25 @@ static int bridge_probe(struct platform_device *device)
 		IRQF_ONESHOT, dev_name(&device->dev), bridge);
 	if (result) goto fail;
 	bridge->misc.minor = MISC_DYNAMIC_MINOR;
-	bridge->misc.name = bridge->mailbox ? "hyper-io-control" : "hyper-io-notification";
+	{
+		u32 client;
+		const char *base = bridge->mailbox ? "hyper-io-control" : "hyper-io-notification";
+		if (of_find_property(device->dev.of_node, "hyper,client-id", NULL)) {
+			if (of_property_read_u32(device->dev.of_node, "hyper,client-id", &client) || client >= 128) {
+				result = -EINVAL; goto free_irq;
+			}
+			bridge->misc.name = kasprintf(GFP_KERNEL, "%s-%u", base, client);
+		} else bridge->misc.name = kstrdup(base, GFP_KERNEL);
+		if (!bridge->misc.name) { result = -ENOMEM; goto free_irq; }
+	}
 	bridge->misc.mode = 0600; bridge->misc.fops = &bridge_operations;
 	bridge->misc.parent = &device->dev;
 	result = misc_register(&bridge->misc);
-	if (result) { devm_free_irq(&device->dev, bridge->irq, bridge); goto fail; }
+	if (result) goto free_irq;
 	platform_set_drvdata(device, bridge);
 	return 0;
+free_irq:
+	devm_free_irq(&device->dev, bridge->irq, bridge);
 fail:
 	kref_put(&bridge->references, bridge_destroy);
 	return result;

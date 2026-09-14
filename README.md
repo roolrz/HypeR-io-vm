@@ -111,3 +111,50 @@ requests without allocating client RAM, notification bindings, or virtqueues.
 HELLO and RESET remain available; ACTIVATE is rejected while no client is
 provisioned. Live client attachment is not implemented by this mode. The
 existing attached deployment and disk acceptance remain unchanged.
+
+### Board volume deployments
+
+The HypeR packager derives `/etc/hyper-volumes.conf` from the board JSON and
+includes it in the bootstrap initramfs. Its first line is `hyper.volumes.v1`;
+each subsequent line is `name PARTUUID sectors owner mapper`, with 512-byte
+sectors. Board boots set `hyper.volumes=required` so a missing manifest is fatal.
+The first volume is `config`, owned by `hyper`, mapped as `hyper-config`.
+
+`hyper-volumes` validates the complete manifest, outer GPT checksums, partition
+identity, capacity and logical sector size before creating any dm-linear volume.
+Each volume receives its own LIO target; volume N uses `naa.5001405%09x` with N
+starting at 1. The appliance does not mount these filesystems, scan guest GPTs,
+or run udev, LVM, RAID discovery or automatic filesystem activation. Linux LIO
+claims the mapped block devices while exporting them. `/etc/hyper-clients.conf` begins with `hyper.clients.v1`, followed by
+`client-id volume-name` lines. Client 0 exclusively owns `config`. Duplicate
+client IDs and duplicate volume assignments are rejected before creating any
+exports. Each authorized client receives a separate service process, vhost fd,
+LIO target, memory mapping, mailbox and notification device.
+
+Shutdown drains vhost before removing LIO exports and dm mappings. A failed
+vhost drain retains mappings until the host quarantines and destroys the I/O VM.
+Old single-disk qualification fixtures without a manifest retain their legacy
+whole-disk setup; they are not board deployment profiles.
+
+For managed slots, each mailbox, notification and guest-memory DTB node carries
+`hyper,client-id = <N>` (0 through 127). The devices are named
+`hyper-io-control-N`, `hyper-io-notification-N` and `hyper-memory-N`. Omitting this
+property preserves legacy naming and fixture behavior. The guest-memory node
+reserves an alias address window and Linux page metadata; the HypeR owner must
+not allocate all possible VM RAM up front or expose the window as ordinary
+allocatable Linux RAM. Linux must not touch unbacked alias contents during boot.
+This platform invariant still needs real Linux boot/QEMU validation.
+
+Managed sessions add two version-1 control operations. `PREPARE_MEMORY` (5) is a
+56-byte record: the existing 40-byte header followed by little-endian frontend
+GPA base and byte length. The HypeR owner installs the actual pages first; the
+service maps only this length, bounded by its DTB window. `RELEASE_MEMORY` (6)
+is a 40-byte record. Its success reply follows synchronous vhost drain, unmap
+and memory-fd closure. Only then may HypeR revoke the alias mapping and free the
+grant. Failure requires quarantine. `RESET` retains the prepared memory for a
+virtio device reset. Reusing a released slot with a new binding requires HELLO
+and a strictly newer epoch; delayed requests from old bindings are rejected.
+Older appliances reject the new operations; callers must fail rather than use
+an unsafe whole-window fallback. Individual normally closed clients retire
+without stopping other services; the owner must keep a slot mailbox alive when
+it intends to reuse that slot via RELEASE/PREPARE.

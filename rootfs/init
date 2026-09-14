@@ -9,11 +9,13 @@ mount -t devtmpfs devtmpfs /dev
 role=unset
 test_mode=none
 mode=attached
+volumes=legacy
 read -r command_line < /proc/cmdline
 for argument in $command_line; do
     case "$argument" in
         hyper.role=*) role=${argument#hyper.role=} ;;
         hyper.mode=*) mode=${argument#hyper.mode=} ;;
+        hyper.volumes=*) volumes=${argument#hyper.volumes=} ;;
         hyper.test=*) test_mode=${argument#hyper.test=} ;;
     esac
 done
@@ -22,11 +24,19 @@ case "$role" in io|business) ;; *) echo 'HypeR I/O: missing/invalid hyper.role';
 case "$mode:$role" in attached:io|attached:business|standby:io) ;;
     *) echo 'HypeR I/O: invalid deployment mode'; poweroff -f; exit 1 ;;
 esac
+case "$volumes" in
+    required) test -f /etc/hyper-volumes.conf; test -f /etc/hyper-clients.conf ;;
+    legacy) ;;
+    *) echo 'HypeR I/O: invalid volume policy'; poweroff -f; exit 1 ;;
+esac
+# Board deployments identify partitions by PARTUUID, independent of disk names.
+if [ "$role" = business ] || [ ! -f /etc/hyper-volumes.conf ]; then
 for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
     [ -b /dev/sda ] && break
     sleep 1
 done
 if [ ! -b /dev/sda ]; then echo 'HypeR I/O: disk discovery failed'; poweroff -f; exit 1; fi
+fi
 if [ "$role" = business ]; then
     /usr/bin/hyper-disk-test /dev/sda
     if [ "$test_mode" = reset ]; then
@@ -46,11 +56,33 @@ if [ "$role" = business ]; then
     poweroff -f
     exit 0
 fi
-if [ "$mode" = attached ]; then
+if [ "$mode" = attached ] || [ -f /etc/hyper-clients.conf ]; then
     insmod "/lib/modules/$(uname -r)/hyper_guest_memory.ko"
 fi
 insmod "/lib/modules/$(uname -r)/hyper_io_bridge.ko"
 mount -t configfs configfs /sys/kernel/config
+if [ -f /etc/hyper-clients.conf ]; then
+    /usr/bin/hyper-volumes clients /etc/hyper-volumes.conf /etc/hyper-clients.conf > /run/hyper-client-plan
+fi
+if [ -f /etc/hyper-volumes.conf ]; then
+    /usr/bin/hyper-volumes create /etc/hyper-volumes.conf
+    index=0
+    {
+        read -r format
+        while read -r name partuuid sectors owner mapper; do
+            index=$((index + 1))
+            core=/sys/kernel/config/target/core/iblock_0/$mapper
+            target=$(printf '/sys/kernel/config/target/vhost/naa.5001405%09x' "$index")
+            mkdir -p "$core"
+            echo "udev_path=/dev/mapper/$mapper" > "$core/control"
+            echo 1 > "$core/enable"
+            mkdir -p "$target/tpgt_1/lun/lun_0"
+            echo naa.5001405000000002 > "$target/tpgt_1/nexus"
+            ln -s "$core" "$target/tpgt_1/lun/lun_0/disk"
+        done
+    } < /etc/hyper-volumes.conf
+else
+    # Legacy explicitly provisioned single-disk qualification fixtures.
 core=/sys/kernel/config/target/core/iblock_0/hyper-disk
 target=/sys/kernel/config/target/vhost/naa.5001405000000001
 mkdir -p "$core"
@@ -59,7 +91,10 @@ echo 1 > "$core/enable"
 mkdir -p "$target/tpgt_1/lun/lun_0"
 echo naa.5001405000000002 > "$target/tpgt_1/nexus"
 ln -s "$core" "$target/tpgt_1/lun/lun_0/disk"
-if [ "$mode" = standby ]; then
+fi
+if [ -f /etc/hyper-clients.conf ]; then
+    : # Each managed client has its own explicitly named memory device.
+elif [ "$mode" = standby ]; then
     set -- --standby
 else
     set -- /dev/hyper-memory-*
@@ -67,5 +102,27 @@ else
 fi
 # Service failure must terminate this VM so its Native owner can quarantine
 # physical DMA before releasing guest grants. No automatic backend restart.
-/usr/bin/hyper-io-service "$1" naa.5001405000000001 || echo 'HypeR I/O: service failed'
+if [ -f /etc/hyper-clients.conf ]; then
+    /usr/bin/hyper-io-supervisor /run/hyper-client-plan || echo 'HypeR I/O: services failed'
+else
+    /usr/bin/hyper-io-service "$1" naa.5001405000000001 || echo 'HypeR I/O: service failed'
+fi
+# Service returns only after vhost drains. Failed quiescence retains mappings.
+if [ -f /etc/hyper-volumes.conf ]; then
+    index=0
+    {
+        read -r format
+        while read -r name partuuid sectors owner mapper; do
+            index=$((index + 1))
+            target=$(printf '/sys/kernel/config/target/vhost/naa.5001405%09x' "$index")
+            rm "$target/tpgt_1/lun/lun_0/disk"
+            rmdir "$target/tpgt_1/lun/lun_0"
+            echo NULL > "$target/tpgt_1/nexus"
+            rmdir "$target/tpgt_1"
+            rmdir "$target"
+            rmdir "/sys/kernel/config/target/core/iblock_0/$mapper"
+        done
+    } < /etc/hyper-volumes.conf
+    /usr/bin/hyper-volumes remove /etc/hyper-volumes.conf
+fi
 poweroff -f

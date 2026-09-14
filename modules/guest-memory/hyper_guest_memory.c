@@ -195,7 +195,13 @@ static int hyper_memory_probe(struct platform_device *device)
 			goto fail;
 		}
 	}
-	memory->misc.name = kasprintf(GFP_KERNEL, "hyper-memory-%s", dev_name(&device->dev));
+	if (of_find_property(device->dev.of_node, "hyper,client-id", NULL)) {
+		u32 client;
+		if (of_property_read_u32(device->dev.of_node, "hyper,client-id", &client) || client >= 128) {
+			result = -EINVAL; goto fail;
+		}
+		memory->misc.name = kasprintf(GFP_KERNEL, "hyper-memory-%u", client);
+	} else memory->misc.name = kasprintf(GFP_KERNEL, "hyper-memory-%s", dev_name(&device->dev));
 	if (!memory->misc.name) {
 		result = -ENOMEM;
 		goto fail;

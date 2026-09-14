@@ -183,7 +183,7 @@ def main():
     input_hashes = {name: digest(checkout / name) for name in module_paths}
     source_dirty |= any(input_hashes[name] != digest(ROOT / name) for name in module_paths)
     for name in ("Makefile", "tools/build.py", "scripts/assemble-io-vm.py", "rootfs/init",
-                 "service/hyper-io-service.c", "tests/io-vm/business-disk.c", "sources.lock.json",
+                 "service/hyper-io-service.c", "service/hyper-volumes.c", "service/hyper-io-supervisor.c", "include/hyper_io_session.h", "tests/io-vm/business-disk.c", "sources.lock.json",
                  "configs/linux-aarch64.config", "configs/busybox.config", "LICENSE", "LICENSES/GPL-2.0-only.txt"):
         input_hashes[name] = digest(ROOT / name)
     if args.platform == "rpi5":
@@ -207,6 +207,8 @@ def main():
         module_identity = hashlib.sha256("".join(digest(path) for path in source_files).encode()).hexdigest()
     binaries = []
     for source, name in (("service/hyper-io-service.c", "hyper-io-service"),
+                         ("service/hyper-volumes.c", "hyper-volumes"),
+                         ("service/hyper-io-supervisor.c", "hyper-io-supervisor"),
                          ("tests/io-vm/business-disk.c", "hyper-disk-test")):
         binary = build / name
         run([args.cross_compile + "gcc", "-static", "-O2", "-Wall", "-Wextra", "-Werror",

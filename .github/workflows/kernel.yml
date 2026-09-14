@@ -48,6 +48,7 @@ jobs:
           gcc -O2 -Wall -Wextra -Werror -Iinclude tests/io-vm/control.c -o /tmp/hyper-control-test
           /tmp/hyper-control-test
       - name: Build the pinned upstream kernel, BusyBox, and external module
+        id: kernel-build
         run: make base CROSS_COMPILE=aarch64-linux-gnu- JOBS=4
       - name: Boot the complete business appliance
         run: |
@@ -91,7 +92,8 @@ jobs:
             target/io-vm/acceptance.log
             target/io-vm/business.log
           if-no-files-found: ignore
-      - name: Retain verified build inputs for Hyper integration
+      - name: Retain build inputs for Hyper integration
+        if: always() && steps.kernel-build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: aarch64-qemu-base
