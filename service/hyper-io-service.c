@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include "hyper_io.h"
 #include "hyper_io_session.h"
+#include "hyper_io_layout.h"
 
 #define VERSION_1 (UINT64_C(1) << 32)
 _Static_assert(sizeof(struct hyper_io_header) == 40, "bridge header layout");
@@ -88,25 +89,42 @@ static int prepare_memory(struct backend *b, const struct hyper_io_prepare_memor
 	if (!b->managed || b->memory != MAP_FAILED || b->memory_fd >= 0 || b->token) return HYPER_IO_BUSY;
 	if (!length || length % 4096 || base % 4096 || base > UINT64_MAX - length ||
 	    (uint64_t)(size_t)length != length) return HYPER_IO_INVALID;
+	uint64_t *pages = NULL;
 	if (prepare.token) {
-		struct hyper_io_admission admission = {.token = prepare.token, .alias = prepare.alias, .length = length};
+		struct hyper_io_admission admission = {.token = prepare.token, .guest_base = base, .length = length};
+		uint64_t cursor = 0;
+		if (prepare.alias || length / 4096 > HYPER_IO_MAX_GRANT_PAGES) return HYPER_IO_INVALID;
 		if (ioctl(b->notification, HYPER_IO_ADMIT, &admission)) return HYPER_IO_INVALID;
+		b->token = prepare.token;
+		pages = calloc(length / 4096, sizeof(*pages));
+		if (!pages) goto failed;
+		for (uint64_t i = 0; i < admission.extent_count; ++i) {
+			struct hyper_io_extent extent = {.index = i};
+			if (ioctl(b->notification, HYPER_IO_EXTENT, &extent) ||
+			    !hyper_io_extent_valid(cursor, length, extent.alias, extent.offset, extent.length)) goto failed;
+			for (uint64_t at = 0; at < extent.length; at += 4096)
+				pages[(cursor + at) / 4096] = extent.alias + at;
+			cursor += extent.length;
+		}
+		if (cursor != length) goto failed;
+		prepare.pages = (uintptr_t)pages; prepare.count = length / 4096;
 	}
-	b->token = prepare.token;
 	int fd = open(b->memory_path, O_RDWR | O_CLOEXEC);
-	if (fd < 0) return release_memory(b) == HYPER_IO_OK ? HYPER_IO_BACKEND_FAILURE : HYPER_IO_QUIESCENCE_FAILED;
+	if (fd < 0) goto failed;
 	b->memory_fd = fd;
 	if (ioctl(fd, HYPER_MEMORY_INFO, &window) || length > window.length ||
-	    ioctl(fd, HYPER_MEMORY_PREPARE, &prepare)) {
-		return release_memory(b) == HYPER_IO_OK ? HYPER_IO_INVALID : HYPER_IO_QUIESCENCE_FAILED;
-	}
-	/* Host has already installed precisely this extent in the alias window.
+	    ioctl(fd, HYPER_MEMORY_PREPARE, &prepare)) goto failed;
+	free(pages); pages = NULL;
+	/* Host has already installed precisely these pages in the alias window.
 	 * The unused address-space reservation is never mapped or touched here. */
 	void *memory = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 	if (memory == MAP_FAILED) return release_memory(b) == HYPER_IO_OK ? HYPER_IO_BACKEND_FAILURE : HYPER_IO_QUIESCENCE_FAILED;
 	b->memory = memory; b->memory_fd = fd; b->token = prepare.token;
 	b->region.guest_base = base; b->region.length = length;
 	return HYPER_IO_OK;
+failed:
+	free(pages);
+	return release_memory(b) == HYPER_IO_OK ? HYPER_IO_BACKEND_FAILURE : HYPER_IO_QUIESCENCE_FAILED;
 }
 static int queue_address(struct backend *b, uint64_t gpa, uint64_t bytes,
 			 uint64_t alignment, uint64_t *result)

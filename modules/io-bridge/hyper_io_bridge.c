@@ -108,7 +108,7 @@ static long notification_ioctl(struct file *file, unsigned int command, unsigned
 	unsigned int i;
 	int result = 0;
 	if (bridge->mailbox) return -ENOTTY;
-	if (command != HYPER_IO_BIND && command != HYPER_IO_UNBIND && command != HYPER_IO_QUIESCENT && command != HYPER_IO_ADMIT) return -ENOTTY;
+	if (command != HYPER_IO_BIND && command != HYPER_IO_UNBIND && command != HYPER_IO_QUIESCENT && command != HYPER_IO_ADMIT && command != HYPER_IO_EXTENT) return -ENOTTY;
 	mutex_lock(&bridge->bind_lock);
 	if (bridge->dead) { result = -ENODEV; goto out; }
 	if (command == HYPER_IO_ADMIT) {
@@ -120,11 +120,29 @@ static long notification_ioctl(struct file *file, unsigned int command, unsigned
 		 * immutable kernel facts instead of trusting a claimed alias/length. */
 		writeq(grant.token, bridge->base + 0x28);
 		if (readq(bridge->base + 0x40)) { result = -EACCES; goto out; }
-		if (readq(bridge->base + 0x30) != grant.alias || readq(bridge->base + 0x38) != grant.length) {
+		if (readq(bridge->base + 0x30) != grant.guest_base || readq(bridge->base + 0x38) != grant.length) {
 			/* Admitted but never touched: retire this token before rejection. */
+			writeq(grant.token, bridge->base + 0x20);
+			result = -EINVAL; goto out;
+		}
+		grant.extent_count = readq(bridge->base + 0x48);
+		if (!grant.extent_count || grant.extent_count > grant.length / 4096 ||
+		    copy_to_user((void __user *)argument, &grant, sizeof(grant))) {
 			writeq(grant.token, bridge->base + 0x20);
 			result = -EINVAL;
 		}
+		goto out;
+	}
+	if (command == HYPER_IO_EXTENT) {
+		struct hyper_io_extent extent;
+		if (bridge->bound) { result = -EBUSY; goto out; }
+		if (copy_from_user(&extent, (void __user *)argument, sizeof(extent))) { result = -EFAULT; goto out; }
+		writeq(extent.index, bridge->base + 0x50);
+		if (readq(bridge->base + 0x70)) { result = -EINVAL; goto out; }
+		extent.alias = readq(bridge->base + 0x58);
+		extent.offset = readq(bridge->base + 0x60);
+		extent.length = readq(bridge->base + 0x68);
+		if (copy_to_user((void __user *)argument, &extent, sizeof(extent))) result = -EFAULT;
 		goto out;
 	}
 	if (command == HYPER_IO_QUIESCENT) {

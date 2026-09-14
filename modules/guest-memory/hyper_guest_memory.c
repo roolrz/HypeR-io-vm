@@ -17,6 +17,7 @@
 #include <linux/compat.h>
 #include <linux/uaccess.h>
 #include "hyper_io.h"
+#include "hyper_io_layout.h"
 #include <linux/kref.h>
 #include <linux/miscdevice.h>
 #include <linux/mm.h>
@@ -30,7 +31,64 @@
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/sizes.h>
+#include <linux/xarray.h>
+#include <linux/sort.h>
 
+struct hyper_granule { unsigned int users; struct dev_pagemap pgmap; };
+static DEFINE_MUTEX(granules_lock);
+static DEFINE_XARRAY(granules);
+
+/* Metadata ownership is per 2 MiB granule. Authorization stays per 4 KiB page. */
+static struct hyper_granule *granule_get(unsigned long index)
+{
+	struct hyper_granule *granule;
+	void *mapping;
+	int result;
+	mutex_lock(&granules_lock);
+	granule = xa_load(&granules, index);
+	if (granule) { ++granule->users; goto out; }
+	granule = kzalloc(sizeof(*granule), GFP_KERNEL);
+	if (!granule) { granule = ERR_PTR(-ENOMEM); goto out; }
+	granule->pgmap.type = MEMORY_DEVICE_GENERIC;
+	granule->pgmap.owner = &granules;
+	granule->pgmap.nr_range = 1;
+	granule->pgmap.range.start = (u64)index * SZ_2M;
+	granule->pgmap.range.end = granule->pgmap.range.start + SZ_2M - 1;
+	if (!request_mem_region(granule->pgmap.range.start, SZ_2M, "hyper-guest-granule")) {
+		kfree(granule); granule = ERR_PTR(-EBUSY); goto out;
+	}
+	mapping = memremap_pages(&granule->pgmap, NUMA_NO_NODE);
+	if (IS_ERR(mapping)) {
+		result = PTR_ERR(mapping); goto release;
+	}
+	result = xa_err(xa_store(&granules, index, granule, GFP_KERNEL));
+	if (result) { memunmap_pages(&granule->pgmap); goto release; }
+	granule->users = 1;
+	goto out;
+release:
+	release_mem_region(granule->pgmap.range.start, SZ_2M);
+	kfree(granule); granule = ERR_PTR(result);
+out:
+	mutex_unlock(&granules_lock);
+	return granule;
+}
+static void granule_put(struct hyper_granule *granule)
+{
+	mutex_lock(&granules_lock);
+	if (--granule->users) { mutex_unlock(&granules_lock); return; }
+	xa_erase(&granules, granule->pgmap.range.start / SZ_2M);
+	mutex_unlock(&granules_lock);
+	/* Keep the resource claimed while waiting for the last page references;
+	 * another admission of this granule fails busy instead of reusing it. */
+	memunmap_pages(&granule->pgmap);
+	release_mem_region(granule->pgmap.range.start, SZ_2M);
+	kfree(granule);
+}
+static int compare_indices(const void *left, const void *right)
+{
+	unsigned long a = *(const unsigned long *)left, b = *(const unsigned long *)right;
+	return (a > b) - (a < b);
+}
 struct hyper_guest_memory {
 	struct miscdevice misc;
 	struct kref references;
@@ -41,7 +99,9 @@ struct hyper_guest_memory {
 	bool dynamic, opened;
 	unsigned int vmas;
 	struct resource aperture;
-	struct dev_pagemap *pgmap;
+	unsigned long *pfns;
+	struct hyper_granule **granules;
+	unsigned int granule_count;
 	u64 guest_base;
 };
 
@@ -49,12 +109,11 @@ struct hyper_guest_memory {
  * memunmap_pages kills admission and waits for every GUP/DMA page reference. */
 static void hyper_memory_unprepare(struct hyper_guest_memory *memory)
 {
-	if (!memory->pgmap) return;
-	memunmap_pages(memory->pgmap);
-	release_mem_region(memory->pgmap->range.start, range_len(&memory->pgmap->range));
-	kfree(memory->pgmap);
-	memory->pgmap = NULL;
-	memory->first_pfn = 0; memory->pages = 0;
+	unsigned int i;
+	for (i = 0; i < memory->granule_count; ++i) granule_put(memory->granules[i]);
+	kvfree(memory->granules); kvfree(memory->pfns);
+	memory->granules = NULL; memory->pfns = NULL; memory->granule_count = 0;
+	if (memory->dynamic) { memory->first_pfn = 0; memory->pages = 0; }
 }
 static void hyper_memory_destroy(struct kref *reference)
 {
@@ -140,7 +199,9 @@ static int hyper_memory_mmap(struct file *file, struct vm_area_struct *vma)
 	/* Do not use remap_pfn_range: VM_PFNMAP cannot supply the normal page
 	 * references consumed by vhost-scsi's scatterlist construction. */
 	for (index = 0; index < count; ++index) {
-		struct page *page = pfn_to_page(memory->first_pfn + vma->vm_pgoff + index);
+		unsigned long pfn = memory->dynamic ? memory->pfns[vma->vm_pgoff + index] :
+			memory->first_pfn + vma->vm_pgoff + index;
+		struct page *page = pfn_to_page(pfn);
 
 		result = vm_insert_page(vma, vma->vm_start + (index << PAGE_SHIFT), page);
 		if (result)
@@ -158,37 +219,54 @@ out:
 static int hyper_memory_prepare(struct hyper_guest_memory *memory,
 		const struct hyper_memory_prepare *prepare)
 {
-	u64 end;
-	struct dev_pagemap *pgmap;
-	void *mapping;
-	if (!prepare->length || !PAGE_ALIGNED(prepare->alias) ||
-	    !PAGE_ALIGNED(prepare->length) || !PAGE_ALIGNED(prepare->guest_base) ||
-	    check_add_overflow(prepare->alias, prepare->length - 1, &end) ||
+	u64 *aliases = NULL;
+	unsigned long *indices = NULL, *pfns = NULL;
+	struct hyper_granule **acquired = NULL;
+	unsigned int i, unique = 0, ready = 0;
+	int result = -EINVAL;
+	if (!prepare->length || !PAGE_ALIGNED(prepare->length) ||
+	    !PAGE_ALIGNED(prepare->guest_base) || prepare->reserved ||
 	    prepare->guest_base > U64_MAX - prepare->length) return -EINVAL;
 	if (!memory->dynamic)
-		return !prepare->token && prepare->alias == ((u64)memory->first_pfn << PAGE_SHIFT) &&
+		return !prepare->token && !prepare->count && !prepare->pages &&
+			prepare->alias == ((u64)memory->first_pfn << PAGE_SHIFT) &&
 			prepare->length <= ((u64)memory->pages << PAGE_SHIFT) ? 0 : -EINVAL;
-	if (!prepare->token) return -EINVAL;
-	if (memory->pgmap) return -EBUSY;
-	if (prepare->alias < memory->aperture.start || end > memory->aperture.end ||
-	    !IS_ALIGNED(prepare->alias, SZ_2M) || !IS_ALIGNED(prepare->length, SZ_2M)) return -EINVAL;
-	pgmap = kzalloc(sizeof(*pgmap), GFP_KERNEL);
-	if (!pgmap) return -ENOMEM;
-	pgmap->type = MEMORY_DEVICE_GENERIC; pgmap->owner = memory; pgmap->nr_range = 1;
-	pgmap->range.start = prepare->alias; pgmap->range.end = end;
-	if (!request_mem_region(prepare->alias, prepare->length, memory->misc.name)) {
-		kfree(pgmap); return -EBUSY;
+	if (!prepare->token || !prepare->count || prepare->count > HYPER_IO_MAX_GRANT_PAGES ||
+	    prepare->count != prepare->length >> PAGE_SHIFT) return -EINVAL;
+	if (memory->pfns) return -EBUSY;
+	aliases = kvmalloc_array(prepare->count, sizeof(*aliases), GFP_KERNEL);
+	indices = kvmalloc_array(prepare->count, sizeof(*indices), GFP_KERNEL);
+	pfns = kvmalloc_array(prepare->count, sizeof(*pfns), GFP_KERNEL);
+	if (!aliases || !indices || !pfns) { result = -ENOMEM; goto out; }
+	if (copy_from_user(aliases, u64_to_user_ptr(prepare->pages), prepare->count * sizeof(*aliases))) {
+		result = -EFAULT; goto out;
 	}
-	mapping = memremap_pages(pgmap, NUMA_NO_NODE);
-	if (IS_ERR(mapping)) {
-		int result = PTR_ERR(mapping);
-		release_mem_region(prepare->alias, prepare->length); kfree(pgmap); return result;
+	if (prepare->alias) goto out;
+	for (i = 0; i < prepare->count; ++i) {
+		if (!hyper_io_page_aperture(aliases[i], memory->aperture.start, memory->aperture.end)) goto out;
+		pfns[i] = aliases[i] >> PAGE_SHIFT;
+		indices[i] = aliases[i] / SZ_2M;
 	}
-	memory->pgmap = pgmap;
-	memory->first_pfn = prepare->alias >> PAGE_SHIFT;
-	memory->pages = prepare->length >> PAGE_SHIFT;
+	sort(indices, prepare->count, sizeof(*indices), compare_indices, NULL);
+	for (i = 0; i < prepare->count; ++i)
+		if (!i || indices[i] != indices[i - 1]) indices[unique++] = indices[i];
+	acquired = kvmalloc_array(unique, sizeof(*acquired), GFP_KERNEL);
+	if (!acquired) { result = -ENOMEM; goto out; }
+	for (; ready < unique; ++ready) {
+		acquired[ready] = granule_get(indices[ready]);
+		if (IS_ERR(acquired[ready])) { result = PTR_ERR(acquired[ready]); goto out; }
+	}
+	/* Publish only after every page/granule has been admitted successfully. */
+	memory->pfns = pfns; pfns = NULL;
+	memory->granules = acquired; acquired = NULL;
+	memory->granule_count = ready; ready = 0;
+	memory->pages = prepare->count;
 	memory->guest_base = prepare->guest_base;
-	return 0;
+	result = 0;
+out:
+	while (ready) granule_put(acquired[--ready]);
+	kvfree(acquired); kvfree(pfns); kvfree(indices); kvfree(aliases);
+	return result;
 }
 static long hyper_memory_ioctl(struct file *file, unsigned int command, unsigned long argument)
 {

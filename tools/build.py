@@ -177,13 +177,13 @@ def main():
     checkout = args.module_source.resolve() if args.module_source else ROOT
     if digest(checkout / "include/hyper_io.h") != digest(ROOT / "include/hyper_io.h"):
         raise ValueError("module checkout and service bridge headers differ")
-    module_paths = ["include/hyper_io.h", "modules/guest-memory/Makefile",
+    module_paths = ["include/hyper_io.h", "include/hyper_io_layout.h", "modules/guest-memory/Makefile",
                     "modules/guest-memory/hyper_guest_memory.c", "modules/io-bridge/Makefile",
                     "modules/io-bridge/hyper_io_bridge.c"]
     input_hashes = {name: digest(checkout / name) for name in module_paths}
     source_dirty |= any(input_hashes[name] != digest(ROOT / name) for name in module_paths)
     for name in ("Makefile", "tools/build.py", "scripts/assemble-io-vm.py", "rootfs/init",
-                 "service/hyper-io-service.c", "service/hyper-volumes.c", "service/hyper-io-supervisor.c", "include/hyper_io_session.h", "tests/io-vm/business-disk.c", "sources.lock.json",
+                 "service/hyper-io-service.c", "service/hyper-volumes.c", "service/hyper-io-supervisor.c", "include/hyper_io_session.h", "include/hyper_io_layout.h", "tests/io-vm/business-disk.c", "sources.lock.json",
                  "configs/linux-aarch64.config", "configs/busybox.config", "LICENSE", "LICENSES/GPL-2.0-only.txt"):
         input_hashes[name] = digest(ROOT / name)
     if args.platform == "rpi5":
@@ -192,7 +192,7 @@ def main():
     module_identity = None
     if args.module_source:
         checkout = args.module_source.resolve()
-        source_files = [checkout / "include/hyper_io.h"]
+        source_files = [checkout / "include/hyper_io.h", checkout / "include/hyper_io_layout.h"]
         for name, basename in (("guest-memory", "hyper_guest_memory"), ("io-bridge", "hyper_io_bridge")):
             module_source = checkout / "modules" / name
             module_output = build / "modules" / name

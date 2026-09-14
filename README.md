@@ -144,7 +144,9 @@ config client. Dynamic nodes instead carry `hyper,dynamic-memory` plus a `reg`
 aperture; they are not declared as Linux RAM and allocate neither host backing
 nor Linux page metadata at boot. PREPARE registers only the authorized actual
 extent using upstream `MEMORY_DEVICE_GENERIC` / `memremap_pages`. Dynamic
-grants require 2 MiB alignment and length; the config pool remains 128 KiB.
+grants retain 4 KiB page granularity; shared 2 MiB device-page metadata is
+created on demand and reference-counted across grants. The config pool remains
+128 KiB. A client is bounded to 1,048,576 pages (4 GiB).
 The alias uses a fixed affine translation of the host physical address,
 represented by standard dma-ranges without rewriting device DMA operations. The HypeR owner excludes
 its I/O VM RAM and static translated pools from that translated range, and must
@@ -174,9 +176,20 @@ the slot owned and cannot be bypassed with HELLO for a new binding.
 
 Before touching a dynamic grant, the notification driver writes its token to
 `0x28` and checks the admission status at `0x40`, then verifies the immutable
-alias and length at `0x30` and `0x38`. HypeR atomically changes Created to
+frontend GPA and length at `0x30` and `0x38`. HypeR atomically changes Created to
 Admitted and binds the token to that notification route. An already admitted or
 retired token cannot be reused, including on another client slot. If metadata
 differs, Linux retires the admitted but untouched token immediately. Native
 cancellation of a never-admitted mapping is safe; admitted mappings require the
 backend's route-authenticated quiescence proof.
+
+Dynamic PREPARE uses alias 0: a scatter grant is identified by its token, not by
+an invented contiguous physical allocation. After admission, the driver reads
+extent count at `0x48`. It writes an index to `0x50` and reads alias, frontend
+offset, length and query status at `0x58`, `0x60`, `0x68` and `0x70`. All are
+64-bit registers. HypeR coalesces physically adjacent pages; Linux validates
+complete ordered coverage before mapping anything. It builds a single userspace
+VMA from the authorized PFNs, so the existing standard vhost memory table stays
+one contiguous frontend GPA region. Unused neighboring pages in a metadata
+granule are never inserted into that VMA. The extent walk happens only during
+admission; it is not part of the storage data path.
