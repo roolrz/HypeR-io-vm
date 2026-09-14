@@ -54,7 +54,7 @@ class Publication(unittest.TestCase):
             source_lock={name: {'url': 'https://example.invalid/' + filename,
                          'sha256': FIXTURE.ASSEMBLE.sha256(self.source_entries['upstream/' + filename])}
                          for name, filename in [('linux', 'linux.tar.xz'), ('busybox', 'busybox.tar.bz2')]})
-        module_paths = ['include/hyper_io.h', 'modules/guest-memory/Makefile',
+        module_paths = ['include/hyper_io.h', 'include/hyper_io_layout.h', 'modules/guest-memory/Makefile',
                         'modules/guest-memory/hyper_guest_memory.c', 'modules/io-bridge/Makefile',
                         'modules/io-bridge/hyper_io_bridge.c']
         metadata['external_module_source_sha256'] = FIXTURE.ASSEMBLE.sha256(
@@ -77,6 +77,16 @@ class Publication(unittest.TestCase):
 
     def prepare(self):
         return PUBLISH.prepare(self.args.output, self.args.base, self.sources, self.output, self.revision)
+
+    def test_common_capabilities_require_every_resolved_pi_builtin(self):
+        config = ''.join('CONFIG_' + name + '=y\n' for name in PUBLISH.PI_BUILTINS).encode()
+        metadata = {'platform': 'qemu'}
+        self.assertEqual(PUBLISH.supported_platforms(metadata, config), ['qemu', 'rpi5'])
+        for name in PUBLISH.PI_BUILTINS:
+            with self.subTest(name=name):
+                incomplete = config.replace(('CONFIG_' + name + '=y').encode(),
+                                            ('CONFIG_' + name + '=m').encode())
+                self.assertEqual(PUBLISH.supported_platforms(metadata, incomplete), ['qemu'])
 
     def test_coherent_boot_package_has_exact_four_payloads(self):
         metadata = self.prepare()

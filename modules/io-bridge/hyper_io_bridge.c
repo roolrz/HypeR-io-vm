@@ -56,6 +56,7 @@ struct bridge {
 	struct eventfd_ctx *kick[3];
 	struct call_binding call[3];
 	bool bound;
+	bool irq_enabled;
 };
 static void notify_call(struct call_binding *call)
 {
@@ -86,7 +87,10 @@ static void unbind(struct bridge *bridge)
 	unsigned int i;
 	/* Caller disables its backend before this ioctl. IRQ synchronization
 	 * excludes all readers of kick[] before eventfd references are released. */
-	disable_irq(bridge->irq);
+	if (bridge->irq_enabled) {
+		disable_irq(bridge->irq);
+		bridge->irq_enabled = false;
+	}
 	for (i = 0; i < 3; ++i) {
 		struct call_binding *call = &bridge->call[i];
 		if (call->queue) {
@@ -99,7 +103,6 @@ static void unbind(struct bridge *bridge)
 		if (bridge->kick[i]) { eventfd_ctx_put(bridge->kick[i]); bridge->kick[i] = NULL; }
 	}
 	bridge->bound = false;
-	enable_irq(bridge->irq);
 }
 static long notification_ioctl(struct file *file, unsigned int command, unsigned long argument)
 {
@@ -108,16 +111,59 @@ static long notification_ioctl(struct file *file, unsigned int command, unsigned
 	unsigned int i;
 	int result = 0;
 	if (bridge->mailbox) return -ENOTTY;
-	if (command != HYPER_IO_BIND && command != HYPER_IO_UNBIND) return -ENOTTY;
+	if (command != HYPER_IO_BIND && command != HYPER_IO_UNBIND && command != HYPER_IO_QUIESCENT && command != HYPER_IO_ADMIT && command != HYPER_IO_EXTENT) return -ENOTTY;
 	mutex_lock(&bridge->bind_lock);
 	if (bridge->dead) { result = -ENODEV; goto out; }
+	if (command == HYPER_IO_ADMIT) {
+		struct hyper_io_admission grant;
+		if (bridge->bound) { result = -EBUSY; goto out; }
+		if (copy_from_user(&grant, (void __user *)argument, sizeof(grant))) { result = -EFAULT; goto out; }
+		if (!grant.token) { result = -EINVAL; goto out; }
+		/* Admission atomically binds the one-use token to this route. Query
+		 * immutable kernel facts instead of trusting a claimed alias/length. */
+		writeq(grant.token, bridge->base + 0x28);
+		if (readq(bridge->base + 0x40)) { result = -EACCES; goto out; }
+		if (readq(bridge->base + 0x30) != grant.guest_base || readq(bridge->base + 0x38) != grant.length) {
+			/* Admitted but never touched: retire this token before rejection. */
+			writeq(grant.token, bridge->base + 0x20);
+			result = -EINVAL; goto out;
+		}
+		grant.extent_count = readq(bridge->base + 0x48);
+		if (!grant.extent_count || grant.extent_count > grant.length / 4096 ||
+		    copy_to_user((void __user *)argument, &grant, sizeof(grant))) {
+			writeq(grant.token, bridge->base + 0x20);
+			result = -EINVAL;
+		}
+		goto out;
+	}
+	if (command == HYPER_IO_EXTENT) {
+		struct hyper_io_extent extent;
+		if (bridge->bound) { result = -EBUSY; goto out; }
+		if (copy_from_user(&extent, (void __user *)argument, sizeof(extent))) { result = -EFAULT; goto out; }
+		writeq(extent.index, bridge->base + 0x50);
+		if (readq(bridge->base + 0x70)) { result = -EINVAL; goto out; }
+		extent.alias = readq(bridge->base + 0x58);
+		extent.offset = readq(bridge->base + 0x60);
+		extent.length = readq(bridge->base + 0x68);
+		if (copy_to_user((void __user *)argument, &extent, sizeof(extent))) result = -EFAULT;
+		goto out;
+	}
+	if (command == HYPER_IO_QUIESCENT) {
+		u64 token;
+		if (bridge->bound) { result = -EBUSY; goto out; }
+		if (copy_from_user(&token, (void __user *)argument, sizeof(token))) { result = -EFAULT; goto out; }
+		if (!token) { result = -EINVAL; goto out; }
+		/* Hyper derives the sender VM from the trapped write, never from a
+		 * caller-controlled Native capability or a claimed peer identifier. */
+		writeq(token, bridge->base + 0x20);
+		goto out;
+	}
 	if (command == HYPER_IO_UNBIND) { unbind(bridge); goto out; }
 	if (bridge->bound) { result = -EBUSY; goto out; }
 	if (copy_from_user(&fds, (void __user *)argument, sizeof(fds))) { result = -EFAULT; goto out; }
 	if (!fds.epoch || fds.reserved || fds.epoch != readl(bridge->base + 0x08) ||
 	    readl(bridge->base + 0x0c)) { result = -EINVAL; goto out; }
-	/* Keep the kick IRQ masked throughout partial preparation. */
-	disable_irq(bridge->irq);
+	/* Unbound notification IRQs remain masked, including before a route exists. */
 	for (i = 0; i < 3; ++i) {
 		struct call_binding *call = &bridge->call[i];
 		struct call_poll poll = {.call = call};
@@ -140,9 +186,11 @@ static long notification_ioctl(struct file *file, unsigned int command, unsigned
 			spin_unlock_irqrestore(&call->queue->lock, flags);
 		}
 	}
-	if (!result) bridge->bound = true;
-	enable_irq(bridge->irq);
-	if (result) unbind(bridge);
+	if (!result) {
+		bridge->bound = true;
+		bridge->irq_enabled = true;
+		enable_irq(bridge->irq);
+	} else unbind(bridge);
 out:
 	mutex_unlock(&bridge->bind_lock);
 	return result;
@@ -167,7 +215,9 @@ static irqreturn_t bridge_irq(int irq, void *opaque)
 }
 static void bridge_destroy(struct kref *ref)
 {
-	kfree(container_of(ref, struct bridge, references));
+	struct bridge *bridge = container_of(ref, struct bridge, references);
+	kfree(bridge->misc.name);
+	kfree(bridge);
 }
 static int bridge_open(struct inode *inode, struct file *file)
 {
@@ -280,8 +330,10 @@ static int bridge_probe(struct platform_device *device)
 	if (!resource || resource_size(resource) < 4096) { result = -EINVAL; goto fail; }
 	bridge->base = devm_ioremap_resource(&device->dev, resource);
 	if (IS_ERR(bridge->base)) { result = PTR_ERR(bridge->base); goto fail; }
-	if (readl(bridge->base) != (bridge->mailbox ? 0x48594d42 : 0x48594e42) ||
-	    readl(bridge->base + 4) != 1) { result = -ENODEV; goto fail; }
+	/* Managed notification routes are installed only when a client binds. */
+	if ((bridge->mailbox || !of_find_property(device->dev.of_node, "hyper,client-id", NULL)) &&
+	    (readl(bridge->base) != (bridge->mailbox ? 0x48594d42 : 0x48594e42) ||
+	     readl(bridge->base + 4) != 1)) { result = -ENODEV; goto fail; }
 	mutex_init(&bridge->control_lock); mutex_init(&bridge->bind_lock);
 	init_waitqueue_head(&bridge->changed); atomic_set(&bridge->opened, 0);
 	atomic64_set(&bridge->irq_generation, 0);
@@ -290,16 +342,28 @@ static int bridge_probe(struct platform_device *device)
 	/* Threaded IRQ context avoids nested eventfd wake recursion and lets the
 	 * supported vhost eventfd consumer schedule its normal kernel worker. */
 	result = devm_request_threaded_irq(&device->dev, bridge->irq, NULL, bridge_irq,
-		IRQF_ONESHOT, dev_name(&device->dev), bridge);
+		IRQF_ONESHOT | (bridge->mailbox ? 0 : IRQF_NO_AUTOEN), dev_name(&device->dev), bridge);
 	if (result) goto fail;
 	bridge->misc.minor = MISC_DYNAMIC_MINOR;
-	bridge->misc.name = bridge->mailbox ? "hyper-io-control" : "hyper-io-notification";
+	{
+		u32 client;
+		const char *base = bridge->mailbox ? "hyper-io-control" : "hyper-io-notification";
+		if (of_find_property(device->dev.of_node, "hyper,client-id", NULL)) {
+			if (of_property_read_u32(device->dev.of_node, "hyper,client-id", &client) || client >= 128) {
+				result = -EINVAL; goto free_irq;
+			}
+			bridge->misc.name = kasprintf(GFP_KERNEL, "%s-%u", base, client);
+		} else bridge->misc.name = kstrdup(base, GFP_KERNEL);
+		if (!bridge->misc.name) { result = -ENOMEM; goto free_irq; }
+	}
 	bridge->misc.mode = 0600; bridge->misc.fops = &bridge_operations;
 	bridge->misc.parent = &device->dev;
 	result = misc_register(&bridge->misc);
-	if (result) { devm_free_irq(&device->dev, bridge->irq, bridge); goto fail; }
+	if (result) goto free_irq;
 	platform_set_drvdata(device, bridge);
 	return 0;
+free_irq:
+	devm_free_irq(&device->dev, bridge->irq, bridge);
 fail:
 	kref_put(&bridge->references, bridge_destroy);
 	return result;
