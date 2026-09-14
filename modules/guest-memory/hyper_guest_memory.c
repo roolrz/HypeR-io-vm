@@ -4,10 +4,10 @@
 /*
  * Expose HypeR-granted RAM as page-backed Linux mappings suitable for vhost.
  *
- * The DT range must be ordinary memory with a reserved-memory reservation,
- * never no-map or reusable. Linux creates struct page metadata but does not
- * allocate these pages. HypeR owns the backing storage for the whole I/O VM
- * lifetime; unbinding this driver does not revoke the foreign mapping.
+ * Static config pools are ordinary memory with a reserved-memory reservation.
+ * Dynamic slots describe only an address aperture; page metadata is created
+ * after the Native owner maps an admitted identity grant and removed before
+ * acknowledging release. This driver never allocates the foreign backing.
  *
  * This external module is distributed separately from the Apache-2.0 HypeR
  * implementation and is built against an unmodified upstream kernel.
@@ -135,9 +135,7 @@ static int hyper_memory_mmap(struct file *file, struct vm_area_struct *vma)
 		result = -ENODEV;
 		goto out;
 	}
-	vma->vm_private_data = memory; vma->vm_ops = &hyper_vma_ops;
-	++memory->vmas;
-	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP | VM_MIXEDMAP);
+		vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP | VM_MIXEDMAP);
 	vm_flags_clear(vma, VM_MAYEXEC);
 	/* Do not use remap_pfn_range: VM_PFNMAP cannot supply the normal page
 	 * references consumed by vhost-scsi's scatterlist construction. */
@@ -147,6 +145,10 @@ static int hyper_memory_mmap(struct file *file, struct vm_area_struct *vma)
 		result = vm_insert_page(vma, vma->vm_start + (index << PAGE_SHIFT), page);
 		if (result)
 			break;
+	}
+	if (!result) {
+		vma->vm_private_data = memory; vma->vm_ops = &hyper_vma_ops;
+		++memory->vmas;
 	}
 out:
 	mutex_unlock(&memory->lock);
@@ -164,8 +166,9 @@ static int hyper_memory_prepare(struct hyper_guest_memory *memory,
 	    check_add_overflow(prepare->alias, prepare->length - 1, &end) ||
 	    prepare->guest_base > U64_MAX - prepare->length) return -EINVAL;
 	if (!memory->dynamic)
-		return prepare->alias == ((u64)memory->first_pfn << PAGE_SHIFT) &&
+		return !prepare->token && prepare->alias == ((u64)memory->first_pfn << PAGE_SHIFT) &&
 			prepare->length <= ((u64)memory->pages << PAGE_SHIFT) ? 0 : -EINVAL;
+	if (!prepare->token) return -EINVAL;
 	if (memory->pgmap) return -EBUSY;
 	if (prepare->alias < memory->aperture.start || end > memory->aperture.end ||
 	    !IS_ALIGNED(prepare->alias, SZ_2M) || !IS_ALIGNED(prepare->length, SZ_2M)) return -EINVAL;

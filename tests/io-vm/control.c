@@ -34,10 +34,10 @@ static void managed_session(void)
     close(sockets[1]);
     const struct { unsigned operation, bytes, status; uint64_t binding, epoch, transaction; } cases[] = {
         {HYPER_IO_HELLO,40,HYPER_IO_OK,7,1,1},
-        {HYPER_IO_PREPARE_MEMORY,64,HYPER_IO_INVALID,7,1,2}, /* invalid empty grant */
+        {HYPER_IO_PREPARE_MEMORY,72,HYPER_IO_INVALID,7,1,2}, /* invalid empty grant */
         {HYPER_IO_RELEASE_MEMORY,40,HYPER_IO_OK,7,1,3},
         {HYPER_IO_RELEASE_MEMORY,40,HYPER_IO_OK,7,1,3}, /* replay successful release */
-        {HYPER_IO_PREPARE_MEMORY,64,HYPER_IO_INVALID,7,1,4}, /* retired binding */
+        {HYPER_IO_PREPARE_MEMORY,72,HYPER_IO_INVALID,7,1,4}, /* retired binding */
         {HYPER_IO_HELLO,40,HYPER_IO_INVALID,8,1,1}, /* epoch reuse */
         {HYPER_IO_HELLO,40,HYPER_IO_OK,8,2,1},
         {HYPER_IO_RELEASE_MEMORY,40,HYPER_IO_INVALID,7,1,5}, /* stale owner */

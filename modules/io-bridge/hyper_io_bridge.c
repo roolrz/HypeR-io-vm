@@ -108,9 +108,35 @@ static long notification_ioctl(struct file *file, unsigned int command, unsigned
 	unsigned int i;
 	int result = 0;
 	if (bridge->mailbox) return -ENOTTY;
-	if (command != HYPER_IO_BIND && command != HYPER_IO_UNBIND) return -ENOTTY;
+	if (command != HYPER_IO_BIND && command != HYPER_IO_UNBIND && command != HYPER_IO_QUIESCENT && command != HYPER_IO_ADMIT) return -ENOTTY;
 	mutex_lock(&bridge->bind_lock);
 	if (bridge->dead) { result = -ENODEV; goto out; }
+	if (command == HYPER_IO_ADMIT) {
+		struct hyper_io_admission grant;
+		if (bridge->bound) { result = -EBUSY; goto out; }
+		if (copy_from_user(&grant, (void __user *)argument, sizeof(grant))) { result = -EFAULT; goto out; }
+		if (!grant.token) { result = -EINVAL; goto out; }
+		/* Admission atomically binds the one-use token to this route. Query
+		 * immutable kernel facts instead of trusting a claimed alias/length. */
+		writeq(grant.token, bridge->base + 0x28);
+		if (readq(bridge->base + 0x40)) { result = -EACCES; goto out; }
+		if (readq(bridge->base + 0x30) != grant.alias || readq(bridge->base + 0x38) != grant.length) {
+			/* Admitted but never touched: retire this token before rejection. */
+			writeq(grant.token, bridge->base + 0x20);
+			result = -EINVAL;
+		}
+		goto out;
+	}
+	if (command == HYPER_IO_QUIESCENT) {
+		u64 token;
+		if (bridge->bound) { result = -EBUSY; goto out; }
+		if (copy_from_user(&token, (void __user *)argument, sizeof(token))) { result = -EFAULT; goto out; }
+		if (!token) { result = -EINVAL; goto out; }
+		/* Hyper derives the sender VM from the trapped write, never from a
+		 * caller-controlled Native capability or a claimed peer identifier. */
+		writeq(token, bridge->base + 0x20);
+		goto out;
+	}
 	if (command == HYPER_IO_UNBIND) { unbind(bridge); goto out; }
 	if (bridge->bound) { result = -EBUSY; goto out; }
 	if (copy_from_user(&fds, (void __user *)argument, sizeof(fds))) { result = -EFAULT; goto out; }

@@ -145,14 +145,14 @@ aperture; they are not declared as Linux RAM and allocate neither host backing
 nor Linux page metadata at boot. PREPARE registers only the authorized actual
 extent using upstream `MEMORY_DEVICE_GENERIC` / `memremap_pages`. Dynamic
 grants require 2 MiB alignment and length; the config pool remains 128 KiB.
-The alias is the real host physical address so the standard DMA identity range
-can be used without rewriting device DMA operations. The HypeR owner excludes
-its I/O VM RAM and static translated pools from that identity range, and must
-ensure the low identity aperture fits Linux's linear-map address window.
+The alias uses a fixed affine translation of the host physical address,
+represented by standard dma-ranges without rewriting device DMA operations. The HypeR owner excludes
+its I/O VM RAM and static translated pools from that translated range, and must
+ensure the aperture fits Linux's linear-map window and avoids guest MMIO.
 
 Managed sessions add two version-1 control operations. `PREPARE_MEMORY` (5) is a
-64-byte record: the existing 40-byte header followed by little-endian alias
-physical address, frontend GPA base and byte length. The HypeR owner installs the actual pages first; the
+72-byte record: the existing 40-byte header followed by little-endian alias
+physical address, frontend GPA base, byte length and mapping token. The HypeR owner installs the actual pages first; the
 service maps only this length, bounded by its DTB window. `RELEASE_MEMORY` (6)
 is a 40-byte record. Its success reply follows synchronous vhost drain, unmap, dynamic page-reference retirement
 and memory-fd closure. Only then may HypeR revoke the alias mapping and free the
@@ -163,3 +163,20 @@ Older appliances reject the new operations; callers must fail rather than use
 an unsafe whole-window fallback. Individual normally closed clients retire
 without stopping other services; the owner must keep a slot mailbox alive when
 it intends to reuse that slot via RELEASE/PREPARE.
+
+Dynamic mapping tokens are one-use identities issued by HypeR. After all vhost,
+VMA and pgmap references have retired, the Linux notification module writes the
+token to the backend notification register at offset `0x20`. HypeR authenticates
+the actual trapping VM before marking the mapping quiescent. A mailbox reply
+alone is not permission to revoke a live mapping. Static config uses token 0
+and does not produce this dynamic-grant proof. A failed memory retirement keeps
+the slot owned and cannot be bypassed with HELLO for a new binding.
+
+Before touching a dynamic grant, the notification driver writes its token to
+`0x28` and checks the admission status at `0x40`, then verifies the immutable
+alias and length at `0x30` and `0x38`. HypeR atomically changes Created to
+Admitted and binds the token to that notification route. An already admitted or
+retired token cannot be reused, including on another client slot. If metadata
+differs, Linux retires the admitted but untouched token immediately. Native
+cancellation of a never-admitted mapping is safe; admitted mappings require the
+backend's route-authenticated quiescence proof.
