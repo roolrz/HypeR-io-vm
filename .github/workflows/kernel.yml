@@ -51,7 +51,7 @@ jobs:
         id: kernel-build
         run: make base CROSS_COMPILE=aarch64-linux-gnu- JOBS=4
       - name: Exercise managed setup with the packaged BusyBox
-        run: python3 -B tests/build/managed-shell.py target/io-vm/build/busybox/busybox
+        run: python3 -B tests/build/managed-shell.py target/io-vm/build/qemu/busybox/busybox
       - name: Boot the complete business appliance
         run: |
           python3 - <<'PYTHON'
