@@ -162,7 +162,9 @@ is a 40-byte record. Its success reply follows synchronous vhost drain, unmap, d
 and memory-fd closure. Only then may HypeR revoke the alias mapping and free the
 grant. Failure requires quarantine. `RESET` retains the prepared memory for a
 virtio device reset. Reusing a released slot with a new binding requires HELLO
-and a strictly newer epoch; delayed requests from old bindings are rejected.
+and a strictly increasing binding generation. A new notification route may restart
+its queue epoch at one; epochs remain monotonic within one binding. Delayed
+requests from old binding generations are rejected.
 Older appliances reject the new operations; callers must fail rather than use
 an unsafe whole-window fallback. Individual normally closed clients retire
 without stopping other services; the owner must keep a slot mailbox alive when
