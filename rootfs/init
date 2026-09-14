@@ -53,6 +53,11 @@ if [ "$role" = business ]; then
         echo 'HypeR business disk: reset/rebind PASS'
     fi
     echo 'HypeR business disk: acceptance complete'
+    if [ "$test_mode" = hold ]; then
+        # Native lifecycle qualification stops/restarts this VM after I/O.
+        echo 'HypeR business disk: holding for supervisor'
+        while :; do sleep 3600; done
+    fi
     poweroff -f
     exit 0
 fi

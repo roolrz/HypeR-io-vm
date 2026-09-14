@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 
 
 def main():
@@ -14,7 +15,9 @@ def main():
     parser.add_argument('--boot', type=Path, required=True)
     parser.add_argument('--qemu', default='qemu-system-aarch64')
     parser.add_argument('--log', type=Path, required=True)
-    parser.add_argument('--reset', action='store_true')
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument('--reset', action='store_true')
+    modes.add_argument('--hold', action='store_true')
     args = parser.parse_args()
     manifest = json.loads((args.boot / 'boot-artifacts.json').read_text())
     args.log.parent.mkdir(parents=True, exist_ok=True)
@@ -29,12 +32,33 @@ def main():
                    '-kernel', str(args.boot / manifest['kernel']),
                    '-initrd', str(args.boot / manifest['initramfs']),
                    '-append', 'console=ttyAMA0 rdinit=/init panic=-1 hyper.role=business'
-                   + (' hyper.test=reset' if args.reset else '')]
+                   + (' hyper.test=reset' if args.reset else ' hyper.test=hold' if args.hold else '')]
         with args.log.open('wb') as log:
-            result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=log,
-                                    stderr=subprocess.STDOUT, timeout=60)
+            if args.hold:
+                child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log,
+                                         stderr=subprocess.STDOUT)
+                try:
+                    limit = time.monotonic() + 60
+                    while b'HypeR business disk: holding for supervisor' not in args.log.read_bytes():
+                        if child.poll() is not None or time.monotonic() > limit:
+                            raise RuntimeError('hold-mode appliance did not remain alive after I/O')
+                        time.sleep(0.1)
+                    time.sleep(1)
+                    if child.poll() is not None:
+                        raise RuntimeError('hold-mode appliance powered off unexpectedly')
+                finally:
+                    child.terminate()
+                    try:
+                        child.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        child.kill(); child.wait()
+                returncode = 0
+            else:
+                result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=log,
+                                        stderr=subprocess.STDOUT, timeout=60)
+                returncode = result.returncode
         log = args.log.read_text(errors='replace')
-        if result.returncode or 'HypeR business disk: acceptance complete' not in log or 'Kernel panic' in log:
+        if returncode or 'HypeR business disk: acceptance complete' not in log or 'Kernel panic' in log:
             raise RuntimeError(f'business appliance failed: {args.log}')
         if args.reset and 'HypeR business disk: reset/rebind PASS' not in log:
             raise RuntimeError(f'business reset/rebind failed: {args.log}')

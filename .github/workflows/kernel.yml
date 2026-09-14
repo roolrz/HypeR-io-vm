@@ -61,6 +61,8 @@ jobs:
           boot = json.loads(Path('target/io-vm/qemu-boot.json').read_text())
           subprocess.run(['python3', '-B', 'tests/io-vm/business.py', '--boot', boot['directory'],
                           '--log', 'target/io-vm/business.log', '--reset'], check=True)
+          subprocess.run(['python3', '-B', 'tests/io-vm/business.py', '--boot', boot['directory'],
+                          '--log', 'target/io-vm/business-hold.log', '--hold'], check=True)
           PYTHON
       - name: Compile the AArch64 disk fixture
         run: aarch64-linux-gnu-gcc -static -O2 -Wall -Wextra -Werror tests/io-vm/vhost-scsi.c -o target/io-vm/vhost-scsi-test
@@ -93,6 +95,7 @@ jobs:
           path: |
             target/io-vm/acceptance.log
             target/io-vm/business.log
+            target/io-vm/business-hold.log
           if-no-files-found: ignore
       - name: Retain build inputs for Hyper integration
         if: always() && steps.kernel-build.outcome == 'success'
