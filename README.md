@@ -98,6 +98,8 @@ contract.
 ## Licensing
 
 Original build tools, configurations, and tests are Apache-2.0; see [LICENSE](LICENSE).
+Project-authored `hyper_io.h` and `hyper_io_layout.h` offer Apache-2.0 OR
+GPL-2.0-only for their userspace and kernel consumers.
 Linux bridge modules in `modules/` are GPL-2.0-only; see
 [GPL-2.0](LICENSES/GPL-2.0-only.txt) and per-file SPDX headers. Linux and BusyBox
 retain their upstream licenses. Binary releases must carry matching source

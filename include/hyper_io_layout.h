@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 roolrz
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-only
 #ifndef HYPER_IO_LAYOUT_H
 #define HYPER_IO_LAYOUT_H
 #ifdef __KERNEL__
