@@ -37,7 +37,7 @@ struct hyper_io_activate {
 };
 struct hyper_io_prepare_memory {
 	struct hyper_io_header header;
-	__le64 guest_base, length;
+	__le64 alias, guest_base, length;
 };
 struct hyper_io_reply {
 	struct hyper_io_header header;
@@ -53,6 +53,7 @@ struct hyper_io_eventfds {
 struct hyper_memory_info {
 	__u64 guest_base, length;
 };
+struct hyper_memory_prepare { __u64 alias, guest_base, length; };
 /* Shared by the Linux wait loop and its deterministic delayed-IRQ test.
  * A one-shot IRQ can mask a newer arm without making RX_READY true. */
 #define HYPER_IO_MAILBOX_CLOSED 4U
@@ -63,5 +64,7 @@ static inline int hyper_io_wait_ready(__u32 status, __u32 wanted,
 }
 #define HYPER_IO_BIND _IOW('H', 0x40, struct hyper_io_eventfds)
 #define HYPER_IO_UNBIND _IO('H', 0x41)
+#define HYPER_MEMORY_PREPARE _IOW('H', 0x43, struct hyper_memory_prepare)
+#define HYPER_MEMORY_RELEASE _IO('H', 0x44)
 #define HYPER_MEMORY_INFO _IOR('H', 0x42, struct hyper_memory_info)
 #endif

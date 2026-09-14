@@ -24,8 +24,12 @@
 #include <linux/mutex.h>
 #include <linux/of_address.h>
 #include <linux/overflow.h>
+#include <linux/memremap.h>
+#include <linux/memory_hotplug.h>
+#include <linux/ioport.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
+#include <linux/sizes.h>
 
 struct hyper_guest_memory {
 	struct miscdevice misc;
@@ -34,16 +38,32 @@ struct hyper_guest_memory {
 	unsigned long first_pfn;
 	unsigned long pages;
 	bool live;
+	bool dynamic, opened;
+	unsigned int vmas;
+	struct resource aperture;
+	struct dev_pagemap *pgmap;
 	u64 guest_base;
 };
 
+/* Caller owns lock; no mmap can be created while this teardown is running.
+ * memunmap_pages kills admission and waits for every GUP/DMA page reference. */
+static void hyper_memory_unprepare(struct hyper_guest_memory *memory)
+{
+	if (!memory->pgmap) return;
+	memunmap_pages(memory->pgmap);
+	release_mem_region(memory->pgmap->range.start, range_len(&memory->pgmap->range));
+	kfree(memory->pgmap);
+	memory->pgmap = NULL;
+	memory->first_pfn = 0; memory->pages = 0;
+}
 static void hyper_memory_destroy(struct kref *reference)
 {
 	struct hyper_guest_memory *memory =
 		container_of(reference, struct hyper_guest_memory, references);
 	unsigned long index;
 
-	for (index = 0; index < memory->pages; ++index)
+	hyper_memory_unprepare(memory);
+	for (index = 0; !memory->dynamic && index < memory->pages; ++index)
 		put_page(pfn_to_page(memory->first_pfn + index));
 	kfree(memory->misc.name);
 	kfree(memory);
@@ -61,8 +81,11 @@ static int hyper_memory_open(struct inode *inode, struct file *file)
 	mutex_lock(&memory->lock);
 	if (!memory->live)
 		result = -ENODEV;
+	else if (memory->dynamic && memory->opened)
+		result = -EBUSY;
 	else {
 		kref_get(&memory->references);
+		memory->opened = true;
 		file->private_data = memory;
 	}
 	mutex_unlock(&memory->lock);
@@ -74,10 +97,27 @@ static int hyper_memory_release(struct inode *inode, struct file *file)
 	struct hyper_guest_memory *memory = file->private_data;
 
 	/* A VMA keeps the file and its module owner alive even after close(fd). */
+	mutex_lock(&memory->lock);
+	if (memory->dynamic) hyper_memory_unprepare(memory);
+	memory->opened = false;
+	mutex_unlock(&memory->lock);
 	kref_put(&memory->references, hyper_memory_destroy);
 	return 0;
 }
 
+static void hyper_vma_open(struct vm_area_struct *vma)
+{
+	struct hyper_guest_memory *memory = vma->vm_private_data;
+	mutex_lock(&memory->lock); ++memory->vmas; mutex_unlock(&memory->lock);
+}
+static void hyper_vma_close(struct vm_area_struct *vma)
+{
+	struct hyper_guest_memory *memory = vma->vm_private_data;
+	mutex_lock(&memory->lock); --memory->vmas; mutex_unlock(&memory->lock);
+}
+static const struct vm_operations_struct hyper_vma_ops = {
+	.open = hyper_vma_open, .close = hyper_vma_close,
+};
 static int hyper_memory_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	struct hyper_guest_memory *memory = file->private_data;
@@ -87,13 +127,16 @@ static int hyper_memory_mmap(struct file *file, struct vm_area_struct *vma)
 
 	if (!(vma->vm_flags & VM_SHARED) || (vma->vm_flags & VM_EXEC))
 		return -EINVAL;
-	if (vma->vm_pgoff >= memory->pages || count > memory->pages - vma->vm_pgoff)
-		return -EINVAL;
 	mutex_lock(&memory->lock);
+	if (vma->vm_pgoff >= memory->pages || count > memory->pages - vma->vm_pgoff) {
+		result = -EINVAL; goto out;
+	}
 	if (!memory->live) {
 		result = -ENODEV;
 		goto out;
 	}
+	vma->vm_private_data = memory; vma->vm_ops = &hyper_vma_ops;
+	++memory->vmas;
 	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP | VM_MIXEDMAP);
 	vm_flags_clear(vma, VM_MAYEXEC);
 	/* Do not use remap_pfn_range: VM_PFNMAP cannot supply the normal page
@@ -110,17 +153,58 @@ out:
 	return result;
 }
 
+static int hyper_memory_prepare(struct hyper_guest_memory *memory,
+		const struct hyper_memory_prepare *prepare)
+{
+	u64 end;
+	struct dev_pagemap *pgmap;
+	void *mapping;
+	if (!prepare->length || !PAGE_ALIGNED(prepare->alias) ||
+	    !PAGE_ALIGNED(prepare->length) || !PAGE_ALIGNED(prepare->guest_base) ||
+	    check_add_overflow(prepare->alias, prepare->length - 1, &end) ||
+	    prepare->guest_base > U64_MAX - prepare->length) return -EINVAL;
+	if (!memory->dynamic)
+		return prepare->alias == ((u64)memory->first_pfn << PAGE_SHIFT) &&
+			prepare->length <= ((u64)memory->pages << PAGE_SHIFT) ? 0 : -EINVAL;
+	if (memory->pgmap) return -EBUSY;
+	if (prepare->alias < memory->aperture.start || end > memory->aperture.end ||
+	    !IS_ALIGNED(prepare->alias, SZ_2M) || !IS_ALIGNED(prepare->length, SZ_2M)) return -EINVAL;
+	pgmap = kzalloc(sizeof(*pgmap), GFP_KERNEL);
+	if (!pgmap) return -ENOMEM;
+	pgmap->type = MEMORY_DEVICE_GENERIC; pgmap->owner = memory; pgmap->nr_range = 1;
+	pgmap->range.start = prepare->alias; pgmap->range.end = end;
+	if (!request_mem_region(prepare->alias, prepare->length, memory->misc.name)) {
+		kfree(pgmap); return -EBUSY;
+	}
+	mapping = memremap_pages(pgmap, NUMA_NO_NODE);
+	if (IS_ERR(mapping)) {
+		int result = PTR_ERR(mapping);
+		release_mem_region(prepare->alias, prepare->length); kfree(pgmap); return result;
+	}
+	memory->pgmap = pgmap;
+	memory->first_pfn = prepare->alias >> PAGE_SHIFT;
+	memory->pages = prepare->length >> PAGE_SHIFT;
+	memory->guest_base = prepare->guest_base;
+	return 0;
+}
 static long hyper_memory_ioctl(struct file *file, unsigned int command, unsigned long argument)
 {
 	struct hyper_guest_memory *memory = file->private_data;
 	struct hyper_memory_info info;
+	struct hyper_memory_prepare prepare;
 	int result = 0;
-	if (command != HYPER_MEMORY_INFO) return -ENOTTY;
+	if (command != HYPER_MEMORY_INFO && command != HYPER_MEMORY_PREPARE &&
+	    command != HYPER_MEMORY_RELEASE) return -ENOTTY;
+	if (command == HYPER_MEMORY_PREPARE && copy_from_user(&prepare, (void __user *)argument, sizeof(prepare))) return -EFAULT;
 	mutex_lock(&memory->lock);
 	if (!memory->live) result = -ENODEV;
-	else {
+	else if (command == HYPER_MEMORY_PREPARE) result = hyper_memory_prepare(memory, &prepare);
+	else if (command == HYPER_MEMORY_RELEASE) {
+		if (memory->vmas) result = -EBUSY;
+		else hyper_memory_unprepare(memory);
+	} else {
 		info.guest_base = memory->guest_base;
-		info.length = (u64)memory->pages << PAGE_SHIFT;
+		info.length = memory->dynamic ? resource_size(&memory->aperture) : (u64)memory->pages << PAGE_SHIFT;
 		if (copy_to_user((void __user *)argument, &info, sizeof(info))) result = -EFAULT;
 	}
 	mutex_unlock(&memory->lock);
@@ -142,9 +226,18 @@ static int hyper_memory_probe(struct platform_device *device)
 	struct device_node *region;
 	struct resource resource;
 	resource_size_t bytes;
-	unsigned long total;
+	unsigned long total = 0;
 	int result;
 
+	if (of_property_read_bool(device->dev.of_node, "hyper,dynamic-memory")) {
+		memory = kzalloc(sizeof(*memory), GFP_KERNEL);
+		if (!memory) return -ENOMEM;
+		kref_init(&memory->references); mutex_init(&memory->lock);
+		memory->dynamic = true;
+		result = of_address_to_resource(device->dev.of_node, 0, &memory->aperture);
+		if (result || !resource_size(&memory->aperture)) { result = -EINVAL; goto fail; }
+		goto register_device;
+	}
 	region = of_parse_phandle(device->dev.of_node, "memory-region", 0);
 	if (!region)
 		return -EINVAL;
@@ -195,6 +288,7 @@ static int hyper_memory_probe(struct platform_device *device)
 			goto fail;
 		}
 	}
+register_device:
 	if (of_find_property(device->dev.of_node, "hyper,client-id", NULL)) {
 		u32 client;
 		if (of_property_read_u32(device->dev.of_node, "hyper,client-id", &client) || client >= 128) {
@@ -215,7 +309,8 @@ static int hyper_memory_probe(struct platform_device *device)
 	if (result)
 		goto fail;
 	platform_set_drvdata(device, memory);
-	dev_info(&device->dev, "registered %lu reserved shared pages\n", total);
+	if (memory->dynamic) dev_info(&device->dev, "registered dynamic grant aperture\n");
+	else dev_info(&device->dev, "registered %lu reserved shared pages\n", total);
 	return 0;
 fail:
 	kref_put(&memory->references, hyper_memory_destroy);

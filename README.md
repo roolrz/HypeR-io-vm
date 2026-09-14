@@ -139,17 +139,22 @@ whole-disk setup; they are not board deployment profiles.
 For managed slots, each mailbox, notification and guest-memory DTB node carries
 `hyper,client-id = <N>` (0 through 127). The devices are named
 `hyper-io-control-N`, `hyper-io-notification-N` and `hyper-memory-N`. Omitting this
-property preserves legacy naming and fixture behavior. The guest-memory node
-reserves an alias address window and Linux page metadata; the HypeR owner must
-not allocate all possible VM RAM up front or expose the window as ordinary
-allocatable Linux RAM. Linux must not touch unbacked alias contents during boot.
-This platform invariant still needs real Linux boot/QEMU validation.
+property preserves legacy naming and fixture behavior. Static guest-memory nodes retain their reserved-memory backing for the Native
+config client. Dynamic nodes instead carry `hyper,dynamic-memory` plus a `reg`
+aperture; they are not declared as Linux RAM and allocate neither host backing
+nor Linux page metadata at boot. PREPARE registers only the authorized actual
+extent using upstream `MEMORY_DEVICE_GENERIC` / `memremap_pages`. Dynamic
+grants require 2 MiB alignment and length; the config pool remains 128 KiB.
+The alias is the real host physical address so the standard DMA identity range
+can be used without rewriting device DMA operations. The HypeR owner excludes
+its I/O VM RAM and static translated pools from that identity range, and must
+ensure the low identity aperture fits Linux's linear-map address window.
 
 Managed sessions add two version-1 control operations. `PREPARE_MEMORY` (5) is a
-56-byte record: the existing 40-byte header followed by little-endian frontend
-GPA base and byte length. The HypeR owner installs the actual pages first; the
+64-byte record: the existing 40-byte header followed by little-endian alias
+physical address, frontend GPA base and byte length. The HypeR owner installs the actual pages first; the
 service maps only this length, bounded by its DTB window. `RELEASE_MEMORY` (6)
-is a 40-byte record. Its success reply follows synchronous vhost drain, unmap
+is a 40-byte record. Its success reply follows synchronous vhost drain, unmap, dynamic page-reference retirement
 and memory-fd closure. Only then may HypeR revoke the alias mapping and free the
 grant. Failure requires quarantine. `RESET` retains the prepared memory for a
 virtio device reset. Reusing a released slot with a new binding requires HELLO

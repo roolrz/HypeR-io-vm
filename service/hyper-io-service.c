@@ -22,7 +22,7 @@
 _Static_assert(sizeof(struct hyper_io_header) == 40, "bridge header layout");
 _Static_assert(sizeof(struct hyper_io_activate) == 144, "activation layout");
 _Static_assert(sizeof(struct hyper_io_reply) == 64, "reply layout");
-_Static_assert(sizeof(struct hyper_io_prepare_memory) == 56, "prepare layout");
+_Static_assert(sizeof(struct hyper_io_prepare_memory) == 64, "prepare layout");
 static volatile sig_atomic_t stopping;
 static void stop_signal(int signal) { (void)signal; stopping = 1; }
 struct backend {
@@ -68,20 +68,25 @@ static int release_memory(struct backend *b)
 		if (munmap(b->memory, b->region.length)) return HYPER_IO_QUIESCENCE_FAILED;
 		b->memory = MAP_FAILED;
 	}
-	if (b->memory_fd >= 0) { close(b->memory_fd); b->memory_fd = -1; }
+	if (b->memory_fd >= 0) {
+		if (b->managed && ioctl(b->memory_fd, HYPER_MEMORY_RELEASE)) return HYPER_IO_QUIESCENCE_FAILED;
+		close(b->memory_fd); b->memory_fd = -1;
+	}
 	memset(&b->region, 0, sizeof(b->region));
 	return HYPER_IO_OK;
 }
 static int prepare_memory(struct backend *b, const struct hyper_io_prepare_memory *request)
 {
 	uint64_t base = le64toh(request->guest_base), length = le64toh(request->length);
+	struct hyper_memory_prepare prepare = {.alias = le64toh(request->alias), .guest_base = base, .length = length};
 	struct hyper_memory_info window;
 	if (!b->managed || b->memory != MAP_FAILED || b->memory_fd >= 0) return HYPER_IO_BUSY;
 	if (!length || length % 4096 || base % 4096 || base > UINT64_MAX - length ||
 	    (uint64_t)(size_t)length != length) return HYPER_IO_INVALID;
 	int fd = open(b->memory_path, O_RDWR | O_CLOEXEC);
 	if (fd < 0) return HYPER_IO_BACKEND_FAILURE;
-	if (ioctl(fd, HYPER_MEMORY_INFO, &window) || length > window.length) {
+	if (ioctl(fd, HYPER_MEMORY_INFO, &window) || length > window.length ||
+	    ioctl(fd, HYPER_MEMORY_PREPARE, &prepare)) {
 		close(fd); return HYPER_IO_INVALID;
 	}
 	/* Host has already installed precisely this extent in the alias window.
@@ -210,7 +215,7 @@ static int serve(struct backend *b, int control, uint64_t features)
 					status = HYPER_IO_OK; reply_size = 64;
 					response.features = htole64(features);
 					response.queues = htole32(3); response.queue_max = htole32(128);
-				} else if (operation == HYPER_IO_PREPARE_MEMORY && size == 56 && b->managed && hyper_io_session_preparable(&session)) {
+				} else if (operation == HYPER_IO_PREPARE_MEMORY && size == 64 && b->managed && hyper_io_session_preparable(&session)) {
 					struct hyper_io_prepare_memory request; memcpy(&request, message, sizeof(request));
 					status = prepare_memory(b, &request);
 				} else if (operation == HYPER_IO_RELEASE_MEMORY && size == 40 && b->managed) {
