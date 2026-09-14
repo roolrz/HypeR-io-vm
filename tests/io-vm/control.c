@@ -38,10 +38,10 @@ static void managed_session(void)
         {HYPER_IO_RELEASE_MEMORY,40,HYPER_IO_OK,7,1,3},
         {HYPER_IO_RELEASE_MEMORY,40,HYPER_IO_OK,7,1,3}, /* replay successful release */
         {HYPER_IO_PREPARE_MEMORY,72,HYPER_IO_INVALID,7,1,4}, /* retired binding */
-        {HYPER_IO_HELLO,40,HYPER_IO_INVALID,8,1,1}, /* epoch reuse */
-        {HYPER_IO_HELLO,40,HYPER_IO_OK,8,2,1},
+        {HYPER_IO_HELLO,40,HYPER_IO_OK,8,1,1}, /* fresh notification epoch */
+        {HYPER_IO_HELLO,40,HYPER_IO_INVALID,6,2,1}, /* old binding generation */
         {HYPER_IO_RELEASE_MEMORY,40,HYPER_IO_INVALID,7,1,5}, /* stale owner */
-        {HYPER_IO_RESET,40,HYPER_IO_OK,8,2,2},
+        {HYPER_IO_RESET,40,HYPER_IO_OK,8,1,2},
     };
     for (unsigned i = 0; i < sizeof(cases)/sizeof(cases[0]); ++i) {
         struct hyper_io_prepare_memory request = {0};

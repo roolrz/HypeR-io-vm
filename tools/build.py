@@ -237,7 +237,7 @@ def main():
         rootfs.mkdir()
         run(busybox_make + [f"CONFIG_PREFIX={rootfs}", "install"], env=environment,
             stdout=subprocess.DEVNULL)
-        for name in ("dev", "proc", "sys", "run", "tmp", "etc", f"lib/modules/{release}"):
+        for name in ("dev", "proc", "sys", "run", "tmp", "etc/target", f"lib/modules/{release}"):
             (rootfs / name).mkdir(parents=True, exist_ok=True)
         for module in modules:
             shutil.copyfile(module, rootfs / "lib/modules" / release / module.name)

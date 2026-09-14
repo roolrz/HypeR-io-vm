@@ -3,7 +3,7 @@
 #ifndef HYPER_IO_SESSION_H
 #define HYPER_IO_SESSION_H
 #include <stdint.h>
-/* Native owner chooses binding identities. Retired epochs are never reusable. */
+/* Native owner chooses binding identities. Binding generations never repeat; queue epochs belong to one binding. */
 struct hyper_io_session { uint64_t binding, epoch; int retired; };
 /* 1 starts a fresh session; 0 stays in the current session; -1 rejects it.
  * Caller invokes this only after validating framing and exact HELLO length. */
@@ -12,7 +12,7 @@ static inline int hyper_io_session_admit(struct hyper_io_session *s,
 {
  if (!binding || !epoch || epoch > UINT32_MAX) return -1;
  if (s->binding != binding) {
-  if (!hello || !idle || epoch <= s->epoch) return -1;
+  if (!hello || !idle || binding <= s->binding) return -1;
   s->binding = binding; s->epoch = epoch; s->retired = 0; return 1;
  }
  if (epoch < s->epoch) return -1;

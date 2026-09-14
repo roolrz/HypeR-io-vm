@@ -56,6 +56,7 @@ struct bridge {
 	struct eventfd_ctx *kick[3];
 	struct call_binding call[3];
 	bool bound;
+	bool irq_enabled;
 };
 static void notify_call(struct call_binding *call)
 {
@@ -86,7 +87,10 @@ static void unbind(struct bridge *bridge)
 	unsigned int i;
 	/* Caller disables its backend before this ioctl. IRQ synchronization
 	 * excludes all readers of kick[] before eventfd references are released. */
-	disable_irq(bridge->irq);
+	if (bridge->irq_enabled) {
+		disable_irq(bridge->irq);
+		bridge->irq_enabled = false;
+	}
 	for (i = 0; i < 3; ++i) {
 		struct call_binding *call = &bridge->call[i];
 		if (call->queue) {
@@ -99,7 +103,6 @@ static void unbind(struct bridge *bridge)
 		if (bridge->kick[i]) { eventfd_ctx_put(bridge->kick[i]); bridge->kick[i] = NULL; }
 	}
 	bridge->bound = false;
-	enable_irq(bridge->irq);
 }
 static long notification_ioctl(struct file *file, unsigned int command, unsigned long argument)
 {
@@ -160,8 +163,7 @@ static long notification_ioctl(struct file *file, unsigned int command, unsigned
 	if (copy_from_user(&fds, (void __user *)argument, sizeof(fds))) { result = -EFAULT; goto out; }
 	if (!fds.epoch || fds.reserved || fds.epoch != readl(bridge->base + 0x08) ||
 	    readl(bridge->base + 0x0c)) { result = -EINVAL; goto out; }
-	/* Keep the kick IRQ masked throughout partial preparation. */
-	disable_irq(bridge->irq);
+	/* Unbound notification IRQs remain masked, including before a route exists. */
 	for (i = 0; i < 3; ++i) {
 		struct call_binding *call = &bridge->call[i];
 		struct call_poll poll = {.call = call};
@@ -184,9 +186,11 @@ static long notification_ioctl(struct file *file, unsigned int command, unsigned
 			spin_unlock_irqrestore(&call->queue->lock, flags);
 		}
 	}
-	if (!result) bridge->bound = true;
-	enable_irq(bridge->irq);
-	if (result) unbind(bridge);
+	if (!result) {
+		bridge->bound = true;
+		bridge->irq_enabled = true;
+		enable_irq(bridge->irq);
+	} else unbind(bridge);
 out:
 	mutex_unlock(&bridge->bind_lock);
 	return result;
@@ -326,8 +330,10 @@ static int bridge_probe(struct platform_device *device)
 	if (!resource || resource_size(resource) < 4096) { result = -EINVAL; goto fail; }
 	bridge->base = devm_ioremap_resource(&device->dev, resource);
 	if (IS_ERR(bridge->base)) { result = PTR_ERR(bridge->base); goto fail; }
-	if (readl(bridge->base) != (bridge->mailbox ? 0x48594d42 : 0x48594e42) ||
-	    readl(bridge->base + 4) != 1) { result = -ENODEV; goto fail; }
+	/* Managed notification routes are installed only when a client binds. */
+	if ((bridge->mailbox || !of_find_property(device->dev.of_node, "hyper,client-id", NULL)) &&
+	    (readl(bridge->base) != (bridge->mailbox ? 0x48594d42 : 0x48594e42) ||
+	     readl(bridge->base + 4) != 1)) { result = -ENODEV; goto fail; }
 	mutex_init(&bridge->control_lock); mutex_init(&bridge->bind_lock);
 	init_waitqueue_head(&bridge->changed); atomic_set(&bridge->opened, 0);
 	atomic64_set(&bridge->irq_generation, 0);
@@ -336,7 +342,7 @@ static int bridge_probe(struct platform_device *device)
 	/* Threaded IRQ context avoids nested eventfd wake recursion and lets the
 	 * supported vhost eventfd consumer schedule its normal kernel worker. */
 	result = devm_request_threaded_irq(&device->dev, bridge->irq, NULL, bridge_irq,
-		IRQF_ONESHOT, dev_name(&device->dev), bridge);
+		IRQF_ONESHOT | (bridge->mailbox ? 0 : IRQF_NO_AUTOEN), dev_name(&device->dev), bridge);
 	if (result) goto fail;
 	bridge->misc.minor = MISC_DYNAMIC_MINOR;
 	{

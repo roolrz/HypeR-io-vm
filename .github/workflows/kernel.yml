@@ -42,7 +42,7 @@ jobs:
       - name: Install cross compiler and QEMU
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross bison flex bc libssl-dev libelf-dev kmod qemu-system-arm device-tree-compiler
+          sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross bison flex bc libssl-dev libelf-dev kmod qemu-system-arm qemu-user device-tree-compiler
       - name: Check control protocol and queue boundaries
         run: |
           gcc -O2 -Wall -Wextra -Werror -Iinclude tests/io-vm/control.c -o /tmp/hyper-control-test
@@ -50,6 +50,8 @@ jobs:
       - name: Build the pinned upstream kernel, BusyBox, and external module
         id: kernel-build
         run: make base CROSS_COMPILE=aarch64-linux-gnu- JOBS=4
+      - name: Exercise managed setup with the packaged BusyBox
+        run: python3 -B tests/build/managed-shell.py target/io-vm/build/busybox/busybox
       - name: Boot the complete business appliance
         run: |
           python3 - <<'PYTHON'

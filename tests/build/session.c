@@ -9,7 +9,7 @@ int main(void) {
  assert(hyper_io_session_admit(&s, 1, 1, 1, 1) == 1);
  assert(hyper_io_session_admit(&s, 1, 1, 0, 0) == 0);
  assert(hyper_io_session_admit(&s, 2, 2, 1, 0) == -1); /* live memory */
- assert(hyper_io_session_admit(&s, 2, 1, 1, 1) == -1); /* reused epoch */
+ assert(hyper_io_session_admit(&s, 1, 0, 1, 1) == -1); /* invalid epoch */
  assert(hyper_io_session_admit(&s, 2, 2, 0, 1) == -1); /* no HELLO */
  hyper_io_session_retire(&s);
  assert(!hyper_io_session_preparable(&s));
@@ -23,6 +23,8 @@ int main(void) {
  assert(hyper_io_session_admit(&s, 0, 3, 1, 1) == -1);
  assert(hyper_io_session_admit(&s, 3, (uint64_t)UINT32_MAX + 1, 1, 1) == -1);
  assert(s.binding == 2 && s.epoch == 2);
+ assert(hyper_io_session_admit(&s, 3, 1, 1, 1) == 1); /* fresh route epoch */
+ assert(hyper_io_session_admit(&s, 2, 9, 1, 1) == -1); /* old generation */
  assert(hyper_io_extent_valid(0, 8192, 0x100000, 0, 4096));
  assert(hyper_io_extent_valid(4096, 8192, 0x900000, 4096, 4096));
  assert(!hyper_io_extent_valid(0, 8192, 0x100000, 4096, 4096)); /* gap */
