@@ -31,11 +31,13 @@ qualification remain separate. Downloaded sources and outputs stay in `target/`.
 See [architecture and validation](ARCHITECTURE.md) for the image contract and
 reserved-page vhost-scsi acceptance test.
 
-The manual **Upstream kernel and real-disk acceptance** GitHub workflow rebuilds
+Every push to `main` automatically runs the **Upstream kernel and real-disk
+acceptance** GitHub workflow. It checks source/packaging contracts, rebuilds
 the locked sources and external module, then verifies vhost-scsi against a
-QEMU virtio-scsi disk and independently checks the backing image. Its retained
-base artifact is an integration input, not a published appliance; this test
-does not yet exercise the cross-VM Hyper path.
+QEMU virtio-scsi disk and independently checks the backing image. Successful
+main builds automatically publish the complete appliance as an immutable
+prerelease package. These checks do not yet exercise the cross-VM
+HypeR path; that remains part of qualifying a digest for the main repository.
 
 The build also creates a complete appliance under `target/io-vm/boot/`, selected
 by `qemu-boot.json`, and matching source archives under `source-artifacts/`.
@@ -61,8 +63,13 @@ kernel configuration before uploading. It prints the immutable reference to
 pin in HypeR; no moving `latest` tag is used by the consumer.
 
 The GitHub workflow uses the repository's `GITHUB_TOKEN`; no registry secret is
-required. Build an exact source revision first, run HypeR's cross-VM acceptance
-against its retained `aarch64-qemu-base` artifact, then publish that same run:
+required. A successful main push build triggers publication of that exact run's
+artifact, using version `main-<commit>-run<run-id>-attempt<attempt>`. Failed or
+cancelled builds, PRs, and manual build runs do not auto-publish. The publication
+summary and `published-reference` artifact contain the digest. HypeR's lockfile
+is updated separately after cross-VM qualification.
+
+Manual build and qualified publication remain available:
 
 ```sh
 gh workflow run kernel.yml --ref main -f operation=build
