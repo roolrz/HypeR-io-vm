@@ -2,6 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 name: Publish a qualified I/O appliance
 on:
+  workflow_run:
+    workflows: [Upstream kernel and real-disk acceptance]
+    types: [completed]
+    branches: [main]
   workflow_call:
     inputs:
       qualified_run:
@@ -18,19 +22,27 @@ permissions:
   actions: read
   packages: write
 concurrency:
-  group: publish-io-vm-${{ inputs.version }}
+  group: publish-io-vm-${{ inputs.version || format('main-{0}-run{1}-attempt{2}', github.event.workflow_run.head_sha, github.event.workflow_run.id, github.event.workflow_run.run_attempt) }}
   cancel-in-progress: false
 jobs:
   publish:
+    # Only successful main push builds auto-publish. Manual build runs remain
+    # available for qualification without publication, including branch tests.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Validate the explicitly qualified build identity
         env:
           GH_TOKEN: ${{ github.token }}
-          QUALIFIED_RUN: ${{ inputs.qualified_run }}
-          SOURCE_REVISION: ${{ inputs.revision }}
-          RELEASE_VERSION: ${{ inputs.version }}
+          QUALIFIED_RUN: ${{ inputs.qualified_run || format('{0}', github.event.workflow_run.id) }}
+          SOURCE_REVISION: ${{ inputs.revision || github.event.workflow_run.head_sha }}
+          RELEASE_VERSION: ${{ inputs.version || format('main-{0}-run{1}-attempt{2}', github.event.workflow_run.head_sha, github.event.workflow_run.id, github.event.workflow_run.run_attempt) }}
         run: |
           python3 - <<'PYTHON'
           import json, os, re, subprocess
@@ -56,7 +68,7 @@ jobs:
         with:
           name: aarch64-qemu-base
           path: qualified
-          run-id: ${{ inputs.qualified_run }}
+          run-id: ${{ inputs.qualified_run || format('{0}', github.event.workflow_run.id) }}
           github-token: ${{ github.token }}
       - name: Install pinned ORAS
         uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6
@@ -69,8 +81,8 @@ jobs:
         run: printf '%s' "$GH_TOKEN" | oras login ghcr.io --username "$REGISTRY_USER" --password-stdin
       - name: Publish the qualified binary and corresponding source generation
         env:
-          SOURCE_REVISION: ${{ inputs.revision }}
-          RELEASE_VERSION: ${{ inputs.version }}
+          SOURCE_REVISION: ${{ inputs.revision || github.event.workflow_run.head_sha }}
+          RELEASE_VERSION: ${{ inputs.version || format('main-{0}-run{1}-attempt{2}', github.event.workflow_run.head_sha, github.event.workflow_run.id, github.event.workflow_run.run_attempt) }}
         run: |
           python3 - <<'PYTHON'
           import hashlib, json, os, re, subprocess

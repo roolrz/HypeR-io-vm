@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 name: Upstream kernel and real-disk acceptance
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       operation:
@@ -43,6 +45,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross bison flex bc libssl-dev libelf-dev kmod qemu-system-arm qemu-user device-tree-compiler
+      - name: Check source and packaging contracts
+        run: make test
       - name: Check control protocol and queue boundaries
         run: |
           gcc -O2 -Wall -Wextra -Werror -Iinclude tests/io-vm/control.c -o /tmp/hyper-control-test
