@@ -8,7 +8,7 @@
 #include <sys/wait.h>
 static struct hyper_io_reply exchange(int fd, unsigned int op, uint64_t transaction)
 {
-    struct hyper_io_header request = {.magic=htole32(HYPER_IO_MAGIC), .version=htole16(1),
+    struct hyper_io_header request = {.magic=htole32(HYPER_IO_MAGIC), .version=htole16(HYPER_IO_VERSION),
         .operation=htole16(op), .length=htole32(40), .binding=htole64(7),
         .epoch=htole64(1), .transaction=htole64(transaction)};
     struct hyper_io_reply reply = {0};
@@ -27,7 +27,7 @@ static void managed_session(void)
     if (!child) {
         close(sockets[0]);
         struct backend b = {.managed=1, .memory=MAP_FAILED, .memory_fd=-1, .fd=-1,
-            .notification=-1, .kick={-1,-1,-1}, .call={-1,-1,-1}};
+            .notification=-1, .kick={-1,-1,-1,-1,-1,-1}, .call={-1,-1,-1,-1,-1,-1}};
         assert(serve(&b, sockets[1], VERSION_1) == -1);
         close(sockets[1]); _exit(0);
     }
@@ -45,7 +45,7 @@ static void managed_session(void)
     };
     for (unsigned i = 0; i < sizeof(cases)/sizeof(cases[0]); ++i) {
         struct hyper_io_prepare_memory request = {0};
-        request.header = (struct hyper_io_header){.magic=htole32(HYPER_IO_MAGIC), .version=htole16(1),
+        request.header = (struct hyper_io_header){.magic=htole32(HYPER_IO_MAGIC), .version=htole16(HYPER_IO_VERSION),
             .operation=htole16(cases[i].operation), .length=htole32(cases[i].bytes),
             .binding=htole64(cases[i].binding), .epoch=htole64(cases[i].epoch),
             .transaction=htole64(cases[i].transaction)};
@@ -72,7 +72,7 @@ int main(void)
     pid_t child=fork(); assert(child >= 0);
     if (!child) {
         close(sockets[0]);
-        struct backend b={.fd=-1,.kick={-1,-1,-1},.call={-1,-1,-1}};
+        struct backend b={.fd=-1,.kick={-1,-1,-1,-1,-1,-1},.call={-1,-1,-1,-1,-1,-1}};
         assert(serve(&b,sockets[1],VERSION_1)==-1);
         close(sockets[1]); _exit(0);
     }

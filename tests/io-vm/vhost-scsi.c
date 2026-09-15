@@ -22,21 +22,23 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-#define MEMORY_SIZE (8 * 4096)
+#define MEMORY_SIZE (16 * 4096)
+#define QUEUES 6
 #define GUEST_BASE UINT64_C(0x10000000)
 #define QUEUE_SIZE 8
-#define REQUEST_OFFSET (3 * 4096)
-#define RESPONSE_OFFSET (4 * 4096)
-#define DATA_OFFSET (5 * 4096)
+#define REQUEST_OFFSET (6 * 4096)
+#define RESPONSE_OFFSET (7 * 4096)
+#define DATA_OFFSET (8 * 4096)
 
 struct backend {
 	int fd;
 	int memory_fd;
-	int kick[3];
-	int call[3];
+	int kick[QUEUES];
+	int call[QUEUES];
 	unsigned char *memory;
-	struct vring ring[3];
-	uint16_t next;
+	struct vring ring[QUEUES];
+	uint16_t next[QUEUES];
+	unsigned int selected;
 };
 
 static void cleanup(struct backend *backend)
@@ -45,7 +47,7 @@ static void cleanup(struct backend *backend)
 	 * commands before the mappings or notification descriptors disappear. */
 	if (backend->fd >= 0)
 		close(backend->fd);
-	for (unsigned int i = 0; i < 3; ++i) {
+	for (unsigned int i = 0; i < QUEUES; ++i) {
 		if (backend->kick[i] >= 0)
 			close(backend->kick[i]);
 		if (backend->call[i] >= 0)
@@ -100,7 +102,7 @@ static int prepare(struct backend *backend, const char *memory_device, const cha
 	table.region.userspace_addr = (uintptr_t)backend->memory;
 	if (checked_ioctl(backend->fd, VHOST_SET_MEM_TABLE, &table))
 		return -1;
-	for (unsigned int i = 0; i < 3; ++i) {
+	for (unsigned int i = 0; i < QUEUES; ++i) {
 		struct vhost_vring_state state = { .index = i, .num = QUEUE_SIZE };
 		struct vhost_vring_addr address = { .index = i };
 		struct vhost_vring_file event = { .index = i };
@@ -143,16 +145,16 @@ static int command(struct backend *backend, const unsigned char *cdb,
 {
 	struct virtio_scsi_cmd_req *request = (void *)(backend->memory + REQUEST_OFFSET);
 	struct virtio_scsi_cmd_resp *response = (void *)(backend->memory + RESPONSE_OFFSET);
-	struct vring *ring = &backend->ring[2];
+	struct vring *ring = &backend->ring[backend->selected];
 	uint64_t kick = 1;
-	struct pollfd poller = { .fd = backend->call[2], .events = POLLIN };
+	struct pollfd poller = { .fd = backend->call[backend->selected], .events = POLLIN };
 	int ready;
 
 	memset(request, 0, sizeof(*request));
 	memset(response, 0xff, sizeof(*response));
 	request->lun[0] = 1;
 	request->lun[1] = 1; /* target ID is the LIO tpgt_1 index; LUN is zero. */
-	request->tag = htole64(backend->next + 1);
+	request->tag = htole64(backend->next[backend->selected] + 1);
 	memcpy(request->cdb, cdb, cdb_length);
 	ring->desc[0] = descriptor(REQUEST_OFFSET, sizeof(*request), VRING_DESC_F_NEXT, 1);
 	if (write_data && data_length) {
@@ -164,21 +166,21 @@ static int command(struct backend *backend, const unsigned char *cdb,
 		if (data_length)
 			ring->desc[2] = descriptor(DATA_OFFSET, data_length, VRING_DESC_F_WRITE, 0);
 	}
-	ring->avail->ring[backend->next % QUEUE_SIZE] = 0;
-	++backend->next;
-	__atomic_store_n(&ring->avail->idx, htole16(backend->next), __ATOMIC_RELEASE);
-	if (write(backend->kick[2], &kick, sizeof(kick)) != sizeof(kick))
+	ring->avail->ring[backend->next[backend->selected] % QUEUE_SIZE] = 0;
+	++backend->next[backend->selected];
+	__atomic_store_n(&ring->avail->idx, htole16(backend->next[backend->selected]), __ATOMIC_RELEASE);
+	if (write(backend->kick[backend->selected], &kick, sizeof(kick)) != sizeof(kick))
 		return -1;
 	do {
 		ready = poll(&poller, 1, 5000);
 	} while (ready < 0 && errno == EINTR);
 	if (ready != 1 || !(poller.revents & POLLIN) ||
-	    read(backend->call[2], &kick, sizeof(kick)) != sizeof(kick)) {
+	    read(backend->call[backend->selected], &kick, sizeof(kick)) != sizeof(kick)) {
 		fprintf(stderr, "vhost completion timeout or notification failure\n");
 		return -1;
 	}
-	if (le16toh(__atomic_load_n(&ring->used->idx, __ATOMIC_ACQUIRE)) != backend->next ||
-	    le32toh(ring->used->ring[(backend->next - 1) % QUEUE_SIZE].id) != 0 ||
+	if (le16toh(__atomic_load_n(&ring->used->idx, __ATOMIC_ACQUIRE)) != backend->next[backend->selected] ||
+	    le32toh(ring->used->ring[(backend->next[backend->selected] - 1) % QUEUE_SIZE].id) != 0 ||
 	    response->response != VIRTIO_SCSI_S_OK) {
 		fprintf(stderr, "invalid vhost completion: transport=%u\n", response->response);
 		return -1;
@@ -192,6 +194,7 @@ static int command(struct backend *backend, const unsigned char *cdb,
 
 static int exercise(struct backend *backend)
 {
+	backend->selected = 2;
 	unsigned char *data = backend->memory + DATA_OFFSET;
 	const unsigned char inquiry[6] = {0x12, 0, 0, 0, 96, 0};
 	const unsigned char write10[10] = {0x2a, 0, 0, 0, 0, 8, 0, 0, 1, 0};
@@ -201,6 +204,7 @@ static int exercise(struct backend *backend)
 	if (command(backend, inquiry, sizeof(inquiry), 96, 0) || data[0] != 0)
 		return -1;
 	for (unsigned int round = 0; round < 32; ++round) {
+		backend->selected = 2 + round % (QUEUES - 2);
 		for (unsigned int index = 0; index < 512; ++index)
 			data[index] = (unsigned char)(index + round * 17);
 		int result = command(backend, write10, sizeof(write10), 512, 1);
@@ -253,7 +257,7 @@ int main(int argc, char **argv)
 		return result ? 1 : 0;
 	}
 	struct backend backend = { .fd = -1, .memory_fd = -1,
-		.kick = {-1, -1, -1}, .call = {-1, -1, -1}, .memory = MAP_FAILED };
+		.kick = {-1, -1, -1, -1, -1, -1}, .call = {-1, -1, -1, -1, -1, -1}, .memory = MAP_FAILED };
 	if (argc != 3) {
 		fprintf(stderr, "usage: vhost-scsi-test SHARED_MEMORY_DEVICE TEST_WWPN\n");
 		return 2;

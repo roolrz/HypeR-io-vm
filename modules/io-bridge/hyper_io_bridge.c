@@ -53,8 +53,8 @@ struct bridge {
 	atomic64_t irq_generation;
 	bool mailbox;
 	int irq;
-	struct eventfd_ctx *kick[3];
-	struct call_binding call[3];
+	struct eventfd_ctx *kick[HYPER_IO_QUEUES];
+	struct call_binding call[HYPER_IO_QUEUES];
 	bool bound;
 	bool irq_enabled;
 };
@@ -91,7 +91,7 @@ static void unbind(struct bridge *bridge)
 		disable_irq(bridge->irq);
 		bridge->irq_enabled = false;
 	}
-	for (i = 0; i < 3; ++i) {
+	for (i = 0; i < HYPER_IO_QUEUES; ++i) {
 		struct call_binding *call = &bridge->call[i];
 		if (call->queue) {
 			u64 count;
@@ -164,10 +164,11 @@ static long notification_ioctl(struct file *file, unsigned int command, unsigned
 	if (!fds.epoch || fds.reserved || fds.epoch != readl(bridge->base + 0x08) ||
 	    readl(bridge->base + 0x0c)) { result = -EINVAL; goto out; }
 	/* Unbound notification IRQs remain masked, including before a route exists. */
-	for (i = 0; i < 3; ++i) {
+	for (i = 0; i < HYPER_IO_QUEUES; ++i) {
 		struct call_binding *call = &bridge->call[i];
 		struct call_poll poll = {.call = call};
 		__poll_t ready;
+		if (i >= 3 && fds.kick[i] == -1 && fds.call[i] == -1) continue;
 		bridge->kick[i] = eventfd_ctx_fdget(fds.kick[i]);
 		if (IS_ERR(bridge->kick[i])) { result = PTR_ERR(bridge->kick[i]); bridge->kick[i] = NULL; break; }
 		call->file = eventfd_fget(fds.call[i]);
@@ -207,7 +208,7 @@ static irqreturn_t bridge_irq(int irq, void *opaque)
 	} else {
 		u32 pending = readl(bridge->base + 0x10);
 		unsigned int i;
-		for (i = 0; i < 3; ++i)
+		for (i = 0; i < HYPER_IO_QUEUES; ++i)
 			if ((pending & BIT(i)) && bridge->kick[i])
 				eventfd_signal(bridge->kick[i]);
 	}

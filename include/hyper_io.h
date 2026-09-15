@@ -5,7 +5,8 @@
 #include <linux/types.h>
 #include <linux/ioctl.h>
 #define HYPER_IO_MAGIC 0x314f4948U
-#define HYPER_IO_VERSION 1
+#define HYPER_IO_VERSION 2
+#define HYPER_IO_QUEUES 6
 #define HYPER_IO_RECORD 256
 #define HYPER_IO_MAX_GRANT_PAGES (1U << 20)
 #define HYPER_IO_REPLY 1
@@ -34,7 +35,7 @@ struct hyper_io_queue {
 struct hyper_io_activate {
 	struct hyper_io_header header;
 	__le64 features;
-	struct hyper_io_queue queues[3];
+	struct hyper_io_queue queues[HYPER_IO_QUEUES];
 };
 struct hyper_io_prepare_memory {
 	struct hyper_io_header header;
@@ -49,7 +50,7 @@ struct hyper_io_reply {
 /* Linux-local control ABI. File descriptor numbers never cross the VM boundary. */
 struct hyper_io_eventfds {
 	__u32 epoch, reserved;
-	__s32 kick[3], call[3];
+	__s32 kick[HYPER_IO_QUEUES], call[HYPER_IO_QUEUES];
 };
 struct hyper_memory_info {
 	__u64 guest_base, length;

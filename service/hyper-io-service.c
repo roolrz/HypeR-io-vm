@@ -21,14 +21,14 @@
 
 #define VERSION_1 (UINT64_C(1) << 32)
 _Static_assert(sizeof(struct hyper_io_header) == 40, "bridge header layout");
-_Static_assert(sizeof(struct hyper_io_activate) == 144, "activation layout");
+_Static_assert(sizeof(struct hyper_io_activate) == 240, "activation layout");
 _Static_assert(sizeof(struct hyper_io_reply) == 64, "reply layout");
 _Static_assert(sizeof(struct hyper_io_prepare_memory) == 72, "prepare layout");
 static volatile sig_atomic_t stopping;
 static void stop_signal(int signal) { (void)signal; stopping = 1; }
 struct backend {
 	int notification, memory_fd, fd;
-	int kick[3], call[3];
+	int kick[HYPER_IO_QUEUES], call[HYPER_IO_QUEUES];
 	void *memory;
 	struct hyper_memory_info region;
 	struct vhost_scsi_target target;
@@ -63,7 +63,7 @@ static int quiesce(struct backend *b)
 			return -1;
 		b->bound = 0;
 	}
-	for (unsigned int i = 0; i < 3; ++i) {
+	for (unsigned int i = 0; i < HYPER_IO_QUEUES; ++i) {
 		if (b->kick[i] >= 0) close(b->kick[i]);
 		if (b->call[i] >= 0) close(b->call[i]);
 		b->kick[i] = b->call[i] = -1;
@@ -154,7 +154,8 @@ static int activate(struct backend *b, const struct hyper_io_activate *message, 
 		.region = { .guest_phys_addr = b->region.guest_base,
 			.memory_size = b->region.length, .userspace_addr = (uintptr_t)b->memory },
 	};
-	struct hyper_io_eventfds bridge = { .epoch = le64toh(message->header.epoch) };
+	struct hyper_io_eventfds bridge = { .epoch = le64toh(message->header.epoch),
+		.kick = {-1,-1,-1,-1,-1,-1}, .call = {-1,-1,-1,-1,-1,-1} };
 	if (b->fd >= 0 || b->bound || b->attached) return HYPER_IO_BUSY;
 	/* Standby owns no client RAM or notification endpoint. Never configure
 	 * vhost until an explicitly provisioned client exists. */
@@ -163,13 +164,16 @@ static int activate(struct backend *b, const struct hyper_io_activate *message, 
 	if (features != VERSION_1 || (features & ~offered) || !bridge.epoch)
 		return HYPER_IO_INVALID;
 	/* Validate every queue extent and all overlap before opening a backend. */
-	uint64_t starts[9], ends[9];
-	for (unsigned int i = 0; i < 3; ++i) {
+	uint64_t starts[HYPER_IO_QUEUES * 3] = {0}, ends[HYPER_IO_QUEUES * 3] = {0};
+	for (unsigned int i = 0; i < HYPER_IO_QUEUES; ++i) {
 		uint32_t size = le32toh(message->queues[i].size);
 		uint64_t addresses[3] = {le64toh(message->queues[i].descriptor),
 			le64toh(message->queues[i].available), le64toh(message->queues[i].used)};
 		uint64_t lengths[3] = {16ULL * size, 6 + 2ULL * size, 6 + 8ULL * size};
 		const unsigned int alignments[3] = {16, 2, 4};
+		/* Drivers may leave optional request queues unconfigured. */
+		if (!size && i >= 3 && !message->queues[i].reserved &&
+		    !addresses[0] && !addresses[1] && !addresses[2]) continue;
 		if (!size || size > 128 || (size & (size - 1)) || message->queues[i].reserved)
 			return HYPER_IO_INVALID;
 		for (unsigned int part = 0; part < 3; ++part) {
@@ -187,7 +191,8 @@ static int activate(struct backend *b, const struct hyper_io_activate *message, 
 	if (b->fd < 0 || ioctl(b->fd, VHOST_SET_OWNER, NULL) ||
 	    ioctl(b->fd, VHOST_SET_FEATURES, &features) || ioctl(b->fd, VHOST_SET_MEM_TABLE, &table))
 		goto fail;
-	for (unsigned int i = 0; i < 3; ++i) {
+	for (unsigned int i = 0; i < HYPER_IO_QUEUES; ++i) {
+		if (!message->queues[i].size) continue;
 		struct vhost_vring_state state = {.index = i, .num = le32toh(message->queues[i].size)};
 		struct vhost_vring_addr address = {.index = i, .desc_user_addr = starts[i * 3],
 			.avail_user_addr = starts[i * 3 + 1], .used_user_addr = starts[i * 3 + 2]};
@@ -236,7 +241,7 @@ static int serve(struct backend *b, int control, uint64_t features)
 		memcpy(&header, message, sizeof(header));
 		uint64_t request_binding = le64toh(header.binding), transaction = le64toh(header.transaction);
 		if (!le64toh(header.epoch)) return -1;
-		if (le32toh(header.magic) != HYPER_IO_MAGIC || le16toh(header.version) != 1 ||
+		if (le32toh(header.magic) != HYPER_IO_MAGIC || le16toh(header.version) != HYPER_IO_VERSION ||
 		    le32toh(header.length) != (uint32_t)size || header.flags || !request_binding || !transaction ||
 		    le64toh(header.epoch) > UINT32_MAX) return -1;
 		uint16_t operation = le16toh(header.operation);
@@ -258,21 +263,21 @@ static int serve(struct backend *b, int control, uint64_t features)
 				if (operation == HYPER_IO_HELLO && size == 40 && hyper_io_session_preparable(&session)) {
 					status = HYPER_IO_OK; reply_size = 64;
 					response.features = htole64(features);
-					response.queues = htole32(3); response.queue_max = htole32(128);
+					response.queues = htole32(HYPER_IO_QUEUES); response.queue_max = htole32(128);
 				} else if (operation == HYPER_IO_PREPARE_MEMORY && size == 72 && b->managed && hyper_io_session_preparable(&session)) {
 					struct hyper_io_prepare_memory request; memcpy(&request, message, sizeof(request));
 					status = prepare_memory(b, &request);
 				} else if (operation == HYPER_IO_RELEASE_MEMORY && size == 40 && b->managed) {
 					status = release_memory(b);
 					if (status == HYPER_IO_OK) hyper_io_session_retire(&session);
-				} else if (operation == HYPER_IO_ACTIVATE && size == 144) {
+				} else if (operation == HYPER_IO_ACTIVATE && size == 240) {
 					struct hyper_io_activate request; memcpy(&request, message, sizeof(request));
 					status = activate(b, &request, features);
 				} else if (((operation == HYPER_IO_RESET && size == 40) ||
 				           (operation == HYPER_IO_STOP_QUEUE && size == 48))) {
 					uint32_t queue = 0, reserved = 0;
 					if (size == 48) { memcpy(&queue, message + 40, 4); memcpy(&reserved, message + 44, 4); }
-					if (le32toh(queue) < 3 && !reserved)
+					if (le32toh(queue) < HYPER_IO_QUEUES && !reserved)
 						status = quiesce(b) ? HYPER_IO_QUIESCENCE_FAILED : HYPER_IO_OK;
 				}
 			}
@@ -298,7 +303,7 @@ static int serve(struct backend *b, int control, uint64_t features)
 int main(int argc, char **argv)
 {
 	struct backend b = {.notification = -1, .memory_fd = -1, .fd = -1,
-		.kick = {-1,-1,-1}, .call = {-1,-1,-1}, .memory = MAP_FAILED};
+		.kick = {-1,-1,-1,-1,-1,-1}, .call = {-1,-1,-1,-1,-1,-1}, .memory = MAP_FAILED};
 	if ((argc != 3 && argc != 5) || strlen(argv[2]) >= sizeof(b.target.vhost_wwpn)) return 2;
 	b.managed = argc == 5; b.memory_path = argv[1];
 	struct sigaction action = {.sa_handler = stop_signal};
