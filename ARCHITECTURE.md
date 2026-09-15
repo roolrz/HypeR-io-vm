@@ -11,6 +11,13 @@ it does not rebuild Linux. Its board packager adds versioned bootstrap volume
 and client manifests to the imported rootfs; executable Linux components remain
 owned and built here.
 
+The base initramfs includes BusyBox's full `modprobe`, the matching kernel's
+`modules.builtin` and `modules.builtin.modinfo`, and dependency indexes generated
+by host `depmod` for the packaged external modules. Requests for built-in drivers
+such as `target_core_iblock` succeed without looking for a nonexistent `.ko`;
+unknown modules still fail. Disk acceptance checks both cases, loads the external
+guest-memory module by name, and rejects target-core autoload failure messages.
+
 Linux remains unmodified upstream, initially 6.18.51 from the 6.18 LTS series.
 `sources.lock.json` pins archive checksums. Hyper-specific drivers are external
 modules built against that exact kernel. No private Linux patch set is used.

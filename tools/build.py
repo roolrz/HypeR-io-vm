@@ -241,6 +241,15 @@ def main():
             (rootfs / name).mkdir(parents=True, exist_ok=True)
         for module in modules:
             shutil.copyfile(module, rootfs / "lib/modules" / release / module.name)
+        # Built-in drivers can still be requested through request_module().
+        # Keep the real loader's built-in and dependency lookup functional;
+        # missing modules must continue to fail instead of being hidden.
+        module_directory = rootfs / "lib/modules" / release
+        for name in ("modules.builtin", "modules.builtin.modinfo"):
+            shutil.copyfile(linux_output / name, module_directory / name)
+        (module_directory / "modules.order").write_text(
+            "".join(f"{module.name}\n" for module in modules))
+        run(["depmod", "-b", str(rootfs), release], env=environment)
         (rootfs / "usr/bin").mkdir(parents=True, exist_ok=True)
         for binary in binaries:
             shutil.copyfile(binary, rootfs / "usr/bin" / binary.name)

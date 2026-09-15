@@ -101,6 +101,8 @@ def main():
                 else:
                     raise RuntimeError(f"I/O VM acceptance timed out; see {args.log}")
                 if (process.returncode != 0 or b"Kernel panic" in collected or
+                        b"Unable to load target_core_" in collected or
+                        b"HypeR I/O: module lookup PASS" not in collected or
                         b"HypeR I/O: acceptance complete" not in collected):
                     raise RuntimeError(f"I/O VM acceptance failed; see {args.log}")
                 # Check backing storage independently of the frontend readback.
