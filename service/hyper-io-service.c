@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <linux/vhost.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <stdio.h>
@@ -38,11 +39,43 @@ struct backend {
 	uint64_t token;
 	unsigned diagnostics;
 };
-static void diagnostic(struct backend *b, const char *stage, uint64_t value)
+static const char *operation_name(uint16_t operation)
+{
+	switch (operation) {
+	case HYPER_IO_HELLO: return "HELLO";
+	case HYPER_IO_ACTIVATE: return "ACTIVATE";
+	case HYPER_IO_RESET: return "RESET";
+	case HYPER_IO_STOP_QUEUE: return "STOP_QUEUE";
+	case HYPER_IO_PREPARE_MEMORY: return "PREPARE_MEMORY";
+	case HYPER_IO_RELEASE_MEMORY: return "RELEASE_MEMORY";
+	default: return "UNKNOWN";
+	}
+}
+static const char *status_name(uint32_t status)
+{
+	switch (status) {
+	case HYPER_IO_OK: return "ok";
+	case HYPER_IO_UNSUPPORTED: return "unsupported";
+	case HYPER_IO_INVALID: return "invalid request";
+	case HYPER_IO_BUSY: return "busy";
+	case HYPER_IO_BACKEND_FAILURE: return "backend failure";
+	case HYPER_IO_QUIESCENCE_FAILED: return "quiescence failed";
+	default: return "unknown status";
+	}
+}
+static void diagnostic(struct backend *b, const char *format, ...)
+	__attribute__((format(printf, 2, 3)));
+static void diagnostic(struct backend *b, const char *format, ...)
 {
 	/* Bounded control-plane breadcrumbs; never log the virtqueue data path. */
-	if (b->managed && b->diagnostics++ < 128)
-		fprintf(stderr, "HypeR I/O [%s]: %s %llu\n", b->target.vhost_wwpn, stage, (unsigned long long)value);
+	if (!b->managed || b->diagnostics >= 128) return;
+	b->diagnostics++;
+	char message[256];
+	va_list arguments;
+	va_start(arguments, format);
+	vsnprintf(message, sizeof(message), format, arguments);
+	va_end(arguments);
+	fprintf(stderr, "HypeR I/O [%s]: %s\n", b->target.vhost_wwpn, message);
 }
 static int quiesce(struct backend *b)
 {
@@ -116,20 +149,21 @@ static int prepare_memory(struct backend *b, const struct hyper_io_prepare_memor
 		if (cursor != length) goto failed;
 		prepare.pages = (uintptr_t)pages; prepare.count = length / 4096;
 	}
-	diagnostic(b, "memory open bytes", length);
+	diagnostic(b, "opening shared memory: bytes=%llu", (unsigned long long)length);
 	int fd = open(b->memory_path, O_RDWR | O_CLOEXEC);
 	if (fd < 0) goto failed;
 	b->memory_fd = fd;
-	diagnostic(b, "memory prepare", prepare.token);
+	diagnostic(b, "preparing shared memory: mode=%s, token=%llu",
+		prepare.token ? "page grant" : "alias window", (unsigned long long)prepare.token);
 	if (ioctl(fd, HYPER_MEMORY_INFO, &window) || length > window.length ||
 	    ioctl(fd, HYPER_MEMORY_PREPARE, &prepare)) goto failed;
 	free(pages); pages = NULL;
 	/* Host has already installed precisely these pages in the alias window.
 	 * The unused address-space reservation is never mapped or touched here. */
-	diagnostic(b, "memory mmap", length);
+	diagnostic(b, "mapping shared memory: bytes=%llu", (unsigned long long)length);
 	void *memory = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 	if (memory == MAP_FAILED) return release_memory(b) == HYPER_IO_OK ? HYPER_IO_BACKEND_FAILURE : HYPER_IO_QUIESCENCE_FAILED;
-	diagnostic(b, "memory ready", length);
+	diagnostic(b, "shared memory ready: bytes=%llu", (unsigned long long)length);
 	b->memory = memory; b->memory_fd = fd; b->token = prepare.token;
 	b->region.guest_base = base; b->region.length = length;
 	return HYPER_IO_OK;
@@ -186,7 +220,7 @@ static int activate(struct backend *b, const struct hyper_io_activate *message, 
 					return HYPER_IO_INVALID;
 		}
 	}
-	diagnostic(b, "vhost configure", bridge.epoch);
+	diagnostic(b, "configuring vhost-scsi: epoch=%llu", (unsigned long long)bridge.epoch);
 	b->fd = open("/dev/vhost-scsi", O_RDWR | O_CLOEXEC);
 	if (b->fd < 0 || ioctl(b->fd, VHOST_SET_OWNER, NULL) ||
 	    ioctl(b->fd, VHOST_SET_FEATURES, &features) || ioctl(b->fd, VHOST_SET_MEM_TABLE, &table))
@@ -210,10 +244,10 @@ static int activate(struct backend *b, const struct hyper_io_activate *message, 
 		if (ioctl(b->fd, VHOST_SET_VRING_CALL, &event)) goto fail;
 		bridge.kick[i] = b->kick[i]; bridge.call[i] = b->call[i];
 	}
-	diagnostic(b, "notification bind", bridge.epoch);
+	diagnostic(b, "binding notifications: epoch=%llu", (unsigned long long)bridge.epoch);
 	if (ioctl(b->notification, HYPER_IO_BIND, &bridge)) goto fail;
 	b->bound = 1;
-	diagnostic(b, "vhost endpoint", 0);
+	diagnostic(b, "attaching vhost-scsi endpoint");
 	if (ioctl(b->fd, VHOST_SCSI_SET_ENDPOINT, &b->target)) goto fail;
 	b->attached = 1;
 	return HYPER_IO_OK;
@@ -245,7 +279,10 @@ static int serve(struct backend *b, int control, uint64_t features)
 		    le32toh(header.length) != (uint32_t)size || header.flags || !request_binding || !transaction ||
 		    le64toh(header.epoch) > UINT32_MAX) return -1;
 		uint16_t operation = le16toh(header.operation);
-		diagnostic(b, "received operation", operation);
+		if (operation < HYPER_IO_HELLO || operation > HYPER_IO_RELEASE_MEMORY)
+			diagnostic(b, "request UNKNOWN (opcode=%u)", (unsigned)operation);
+		else
+			diagnostic(b, "request %s", operation_name(operation));
 		int admission = hyper_io_session_admit(&session, request_binding, le64toh(header.epoch),
 			operation == HYPER_IO_HELLO && size == 40,
 			b->managed ? b->memory == MAP_FAILED && b->memory_fd < 0 && b->fd < 0 && !b->bound && !b->token : !session.binding);
@@ -289,13 +326,19 @@ static int serve(struct backend *b, int control, uint64_t features)
 				memcpy(previous, message, size); previous_reply = response;
 			}
 		}
-		diagnostic(b, "reply status", le32toh(response.status));
+		if (le32toh(response.status) == HYPER_IO_OK)
+			diagnostic(b, "reply %s: ok", operation_name(operation));
+		else
+			diagnostic(b, "reply %s: %s (status=%u)", operation_name(operation),
+				status_name(le32toh(response.status)), le32toh(response.status));
 		ssize_t written;
 		do { written = write(control, &response, le32toh(response.header.length)); }
 		while (written < 0 && errno == EINTR && !stopping);
 		if (stopping) return 0;
 		if (written < 0 && errno == EPIPE) return 0;
-		diagnostic(b, "reply bytes", written < 0 ? 0 : (uint64_t)written);
+		if (written != (ssize_t)le32toh(response.header.length))
+			diagnostic(b, "reply write incomplete: written=%zd, expected=%u bytes",
+				written, le32toh(response.header.length));
 		if (written != (ssize_t)le32toh(response.header.length))
 			return -1;
 	}
@@ -327,7 +370,8 @@ int main(int argc, char **argv)
 	if (control < 0 || probe < 0 ||
 	    ioctl(probe, VHOST_GET_FEATURES, &features) || !(features & VERSION_1)) return 1;
 	close(probe); features &= VERSION_1;
-	puts(standby ? "HypeR I/O: standby service ready" : "HypeR I/O: backend service ready"); fflush(stdout);
+	printf("HypeR I/O: %s service ready [%s]\n",
+		standby ? "standby" : "backend", b.target.vhost_wwpn); fflush(stdout);
 	int result = serve(&b, control, features);
 	if (release_memory(&b) != HYPER_IO_OK) {
 		/* No successful acknowledgement or unmap is allowed after failed drain.
