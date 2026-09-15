@@ -9,7 +9,13 @@ mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev
 mount -t configfs configfs /sys/kernel/config
-/usr/bin/vhost-scsi-test --load-module "/lib/modules/$(uname -r)/hyper_guest_memory.ko"
+modprobe target_core_iblock
+modprobe hyper_guest_memory
+if modprobe hyper_intentionally_missing_module >/dev/null 2>&1; then
+    echo 'HypeR I/O: missing module unexpectedly succeeded'
+    exit 1
+fi
+echo 'HypeR I/O: module lookup PASS'
 
 core=/sys/kernel/config/target/core/iblock_0/hyper-test
 target=/sys/kernel/config/target/vhost/naa.5001405000000001
