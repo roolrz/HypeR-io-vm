@@ -161,3 +161,16 @@ concurrent queue reset, runtime exit, I/O VM exit with in-flight operations,
 stale completions, and actual read/write/flush error propagation. QEMU validates
 the integration; Pi 5 must additionally validate DMA address translation,
 cache maintenance, interrupt ordering, device reset, and measured image sizes.
+
+## Four-request-queue bridge generation
+
+Bridge protocol version 2 has six queue records in its 240-byte ACTIVATE
+message: control, event, and four request queues. HELLO advertises six queues.
+The first three queues are mandatory; optional request queues use all-zero
+records when a driver does not configure them. Each configured queue has its
+own kick/call eventfds. RESET and STOP_QUEUE still clear the entire vhost
+endpoint and drain all producers before notification unbind or memory release.
+Version 1 peers are rejected; HypeR must adopt the matching immutable package.
+The Linux acceptance fixture exercises all four request queues against its
+real QEMU block device. Cross-VM qualification additionally checks batched
+requests, notification delivery and retirement in HypeR.
