@@ -22,14 +22,10 @@ make test
 ```
 
 Non-AArch64 builders set `CROSS_COMPILE=aarch64-linux-gnu-`.
-The common AArch64 Image includes QEMU and upstream BCM2712 SDIO dependencies;
-HypeR selects devices with its board DT. The OCI supported-platforms annotation
-is derived from the verified resolved kernel configuration. It describes binary
-capabilities, not Pi hardware qualification. `PLATFORM=rpi5` remains an optional
-build profile; physical board and DMA
-qualification remain separate. Downloaded sources and outputs stay in `target/`.
-See [architecture and validation](ARCHITECTURE.md) for the image contract and
-reserved-page vhost-scsi acceptance test.
+The QEMU and Pi 5 profiles are built and published separately. Select
+`PLATFORM=rpi5` for the existing upstream BCM2712 device configuration, or
+`make all-platforms` to produce both. Platform annotations identify the build
+profile; physical board and DMA qualification remain separate.
 
 Every push to `main` automatically runs the **Upstream kernel and real-disk
 acceptance** GitHub workflow. It checks source/packaging contracts, rebuilds
@@ -208,3 +204,23 @@ VMA from the authorized PFNs, so the existing standard vhost memory table stays
 one contiguous frontend GPA region. Unused neighboring pages in a metadata
 granule are never inserted into that VMA. The extent walk happens only during
 admission; it is not part of the storage data path.
+
+## QEMU and Pi 5 profiles
+
+`make all-platforms` builds two appliances from the same pinned upstream Linux
+and BusyBox sources, using separate build and publication identities. Main
+builds and publishes both matrix entries as `-aarch64-qemu` and
+`-aarch64-rpi5`; each package includes its own resolved configs and matching
+source archive. The Pi 5 profile adds the existing board driver configuration.
+Running it on QEMU checks guest boot, not physical devices or DMA.
+
+For initial Pi 5 guest bring-up, HypeR may select
+`hyper.role=io hyper.mode=bringup`. This mode boots Linux userspace and waits
+under Native VM supervision without probing storage, exporting a LUN, loading
+bridge modules, or advertising backend-service readiness. Do not supply volume
+or client configuration in this mode. Storage-backed deployments continue to
+use `standby` or `attached`; bring-up is never an automatic error fallback.
+
+Sharing this repository does not relicense Linux, BusyBox or the GPL bridge
+modules. Both binary variants retain the same corresponding-source and notice
+requirements described above.
