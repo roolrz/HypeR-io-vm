@@ -222,6 +222,7 @@ def assemble(args):
     result = {
         "format": 1,
         "architecture": args.architecture,
+        "platform": manifest.get("platform", "qemu"),
         "base_manifest_sha256": args.manifest_sha256,
         "kernel": image_name,
         "initramfs": ramdisk_name,

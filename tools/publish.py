@@ -32,24 +32,10 @@ REQUIRED_SOURCES = {
 }
 
 
-# Capability metadata describes the same DT-selected binary, not hardware
-# qualification. A Pi deployment remains unqualified until physical acceptance.
-PI_BUILTINS = (
-    'ARM64', 'ARCH_BCM', 'ARCH_BCM2835', 'COMMON_CLK', 'PINCTRL',
-    'PINCTRL_BRCMSTB', 'PINCTRL_BCM2712', 'GPIOLIB', 'OF_GPIO', 'GPIO_BRCMSTB',
-    'REGULATOR', 'REGULATOR_FIXED_VOLTAGE', 'REGULATOR_GPIO', 'MMC', 'MMC_BLOCK',
-    'MMC_SDHCI', 'MMC_SDHCI_PLTFM', 'MMC_SDHCI_BRCMSTB', 'MMC_CQHCI',
-)
-
-
 def supported_platforms(metadata, config):
-    values = dict(line.split('=', 1) for line in config.decode().splitlines()
-                  if line.startswith('CONFIG_') and '=' in line)
-    result = [metadata['platform']]
-    if metadata['platform'] == 'qemu' and all(values.get('CONFIG_' + name) == 'y'
-                                            for name in PI_BUILTINS):
-        result.append('rpi5')
-    return result
+    # Publication identity follows the selected, independently built profile.
+    # Compiled drivers do not establish physical-hardware qualification.
+    return [metadata['platform']]
 
 
 def verify_sources(sources, metadata, revision):

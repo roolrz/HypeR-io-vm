@@ -21,9 +21,21 @@ for argument in $command_line; do
 done
 # Never test or export a disk unless the boot owner explicitly selected a role.
 case "$role" in io|business) ;; *) echo 'HypeR I/O: missing/invalid hyper.role'; poweroff -f; exit 1 ;; esac
-case "$mode:$role" in attached:io|attached:business|standby:io) ;;
+case "$mode:$role" in attached:io|attached:business|standby:io|bringup:io) ;;
     *) echo 'HypeR I/O: invalid deployment mode'; poweroff -f; exit 1 ;;
 esac
+# Bring-up is explicitly diskless: do not probe/export disks or start a
+# backend which cannot serve requests. The VM remains under Native supervision.
+if [ "$mode" = bringup ]; then
+    if [ "$volumes" != legacy ] || [ -f /etc/hyper-volumes.conf ] || [ -f /etc/hyper-clients.conf ]; then
+        echo 'HypeR I/O: bring-up cannot accept a volume configuration'
+        poweroff -f
+        exit 1
+    fi
+    uname -a
+    echo 'HypeR I/O: bring-up ready; no devices assigned, storage service disabled'
+    while :; do sleep 3600; done
+fi
 case "$volumes" in
     required) test -f /etc/hyper-volumes.conf; test -f /etc/hyper-clients.conf ;;
     legacy) ;;

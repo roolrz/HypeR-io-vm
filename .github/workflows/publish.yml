@@ -34,6 +34,10 @@ jobs:
        github.event.workflow_run.event == 'push' &&
        github.event.workflow_run.head_branch == 'main' &&
        github.event.workflow_run.head_repository.full_name == github.repository)
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [qemu, rpi5]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -41,6 +45,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           QUALIFIED_RUN: ${{ inputs.qualified_run || format('{0}', github.event.workflow_run.id) }}
+          APPLIANCE_PLATFORM: ${{ matrix.platform }}
           SOURCE_REVISION: ${{ inputs.revision || github.event.workflow_run.head_sha }}
           RELEASE_VERSION: ${{ inputs.version || format('main-{0}-run{1}-attempt{2}', github.event.workflow_run.head_sha, github.event.workflow_run.id, github.event.workflow_run.run_attempt) }}
         run: |
@@ -66,7 +71,7 @@ jobs:
       - name: Download the exact immutable build artifact
         uses: actions/download-artifact@v4
         with:
-          name: aarch64-qemu-base
+          name: aarch64-${{ matrix.platform }}-base
           path: qualified
           run-id: ${{ inputs.qualified_run || format('{0}', github.event.workflow_run.id) }}
           github-token: ${{ github.token }}
@@ -81,6 +86,7 @@ jobs:
         run: printf '%s' "$GH_TOKEN" | oras login ghcr.io --username "$REGISTRY_USER" --password-stdin
       - name: Publish the qualified binary and corresponding source generation
         env:
+          APPLIANCE_PLATFORM: ${{ matrix.platform }}
           SOURCE_REVISION: ${{ inputs.revision || github.event.workflow_run.head_sha }}
           RELEASE_VERSION: ${{ inputs.version || format('main-{0}-run{1}-attempt{2}', github.event.workflow_run.head_sha, github.event.workflow_run.id, github.event.workflow_run.run_attempt) }}
         run: |
@@ -98,7 +104,9 @@ jobs:
           with sources[0].open('rb') as source:
               if hashlib.file_digest(source, 'sha256').hexdigest() != sources[0].name.removesuffix('.tar.xz'):
                   raise ValueError('source archive identity differs from the qualified build')
-          reference = 'ghcr.io/roolrz/hyper-io-vm:' + os.environ['RELEASE_VERSION'] + '-aarch64-qemu'
+          if json.loads((base / 'manifest.json').read_text())['platform'] != os.environ['APPLIANCE_PLATFORM']:
+              raise ValueError('artifact platform differs from selected publication profile')
+          reference = 'ghcr.io/roolrz/hyper-io-vm:' + os.environ['RELEASE_VERSION'] + '-aarch64-' + os.environ['APPLIANCE_PLATFORM']
           # Never overwrite an already published version. A registry/auth error
           # also fails closed; only an explicit missing manifest permits upload.
           probe = subprocess.run(['oras', 'manifest', 'fetch', reference], capture_output=True, text=True)
@@ -119,6 +127,6 @@ jobs:
           PYTHON
       - uses: actions/upload-artifact@v4
         with:
-          name: published-reference
+          name: published-reference-${{ matrix.platform }}
           path: published-reference.txt
           if-no-files-found: error

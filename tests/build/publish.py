@@ -78,15 +78,10 @@ class Publication(unittest.TestCase):
     def prepare(self):
         return PUBLISH.prepare(self.args.output, self.args.base, self.sources, self.output, self.revision)
 
-    def test_common_capabilities_require_every_resolved_pi_builtin(self):
-        config = ''.join('CONFIG_' + name + '=y\n' for name in PUBLISH.PI_BUILTINS).encode()
-        metadata = {'platform': 'qemu'}
-        self.assertEqual(PUBLISH.supported_platforms(metadata, config), ['qemu', 'rpi5'])
-        for name in PUBLISH.PI_BUILTINS:
-            with self.subTest(name=name):
-                incomplete = config.replace(('CONFIG_' + name + '=y').encode(),
-                                            ('CONFIG_' + name + '=m').encode())
-                self.assertEqual(PUBLISH.supported_platforms(metadata, incomplete), ['qemu'])
+    def test_platform_identity_is_not_inferred_from_drivers(self):
+        for platform in ('qemu', 'rpi5'):
+            self.assertEqual(PUBLISH.supported_platforms(
+                {'platform': platform}, b'CONFIG_ARCH_BCM2835=y\n'), [platform])
 
     def test_coherent_boot_package_has_exact_four_payloads(self):
         metadata = self.prepare()
