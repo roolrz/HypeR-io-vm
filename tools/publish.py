@@ -25,7 +25,8 @@ REQUIRED_SOURCES = {
     'Makefile', 'tools/build.py', 'scripts/assemble-io-vm.py', 'rootfs/init',
     'include/hyper_io.h', 'include/hyper_io_layout.h', 'include/hyper_io_session.h',
     'service/hyper-volumes.c', 'service/hyper-io-supervisor.c', 'modules/guest-memory/Makefile',
-    'modules/guest-memory/hyper_guest_memory.c', 'modules/io-bridge/Makefile',
+    'modules/guest-memory/memory.c', 'modules/guest-memory/granules.c',
+    'modules/guest-memory/granules.h', 'modules/io-bridge/Makefile',
     'modules/io-bridge/hyper_io_bridge.c', 'service/hyper-io-service.c',
     'tests/io-vm/business-disk.c', 'sources.lock.json',
     'configs/linux-aarch64.config', 'configs/busybox.config', 'LICENSE', 'LICENSES/GPL-2.0-only.txt',
@@ -45,7 +46,8 @@ def verify_sources(sources, metadata, revision):
     if not REQUIRED_SOURCES <= hashes.keys():
         raise ValueError('build manifest lacks required source identities')
     module_paths = ['include/hyper_io.h', 'include/hyper_io_layout.h', 'modules/guest-memory/Makefile',
-                    'modules/guest-memory/hyper_guest_memory.c', 'modules/io-bridge/Makefile',
+                    'modules/guest-memory/memory.c', 'modules/guest-memory/granules.c',
+                    'modules/guest-memory/granules.h', 'modules/io-bridge/Makefile',
                     'modules/io-bridge/hyper_io_bridge.c']
     module_identity = hashlib.sha256(''.join(hashes[name] for name in module_paths).encode()).hexdigest()
     if module_identity != metadata['external_module_source_sha256']:

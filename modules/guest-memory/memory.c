@@ -25,65 +25,12 @@
 #include <linux/mutex.h>
 #include <linux/of_address.h>
 #include <linux/overflow.h>
-#include <linux/memremap.h>
-#include <linux/memory_hotplug.h>
-#include <linux/ioport.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/sizes.h>
-#include <linux/xarray.h>
 #include <linux/sort.h>
+#include "granules.h"
 
-struct hyper_granule { unsigned int users; struct dev_pagemap pgmap; };
-static DEFINE_MUTEX(granules_lock);
-static DEFINE_XARRAY(granules);
-
-/* Metadata ownership is per 2 MiB granule. Authorization stays per 4 KiB page. */
-static struct hyper_granule *granule_get(unsigned long index)
-{
-	struct hyper_granule *granule;
-	void *mapping;
-	int result;
-	mutex_lock(&granules_lock);
-	granule = xa_load(&granules, index);
-	if (granule) { ++granule->users; goto out; }
-	granule = kzalloc(sizeof(*granule), GFP_KERNEL);
-	if (!granule) { granule = ERR_PTR(-ENOMEM); goto out; }
-	granule->pgmap.type = MEMORY_DEVICE_GENERIC;
-	granule->pgmap.owner = &granules;
-	granule->pgmap.nr_range = 1;
-	granule->pgmap.range.start = (u64)index * SZ_2M;
-	granule->pgmap.range.end = granule->pgmap.range.start + SZ_2M - 1;
-	if (!request_mem_region(granule->pgmap.range.start, SZ_2M, "hyper-guest-granule")) {
-		kfree(granule); granule = ERR_PTR(-EBUSY); goto out;
-	}
-	mapping = memremap_pages(&granule->pgmap, NUMA_NO_NODE);
-	if (IS_ERR(mapping)) {
-		result = PTR_ERR(mapping); goto release;
-	}
-	result = xa_err(xa_store(&granules, index, granule, GFP_KERNEL));
-	if (result) { memunmap_pages(&granule->pgmap); goto release; }
-	granule->users = 1;
-	goto out;
-release:
-	release_mem_region(granule->pgmap.range.start, SZ_2M);
-	kfree(granule); granule = ERR_PTR(result);
-out:
-	mutex_unlock(&granules_lock);
-	return granule;
-}
-static void granule_put(struct hyper_granule *granule)
-{
-	mutex_lock(&granules_lock);
-	if (--granule->users) { mutex_unlock(&granules_lock); return; }
-	xa_erase(&granules, granule->pgmap.range.start / SZ_2M);
-	mutex_unlock(&granules_lock);
-	/* Keep the resource claimed while waiting for the last page references;
-	 * another admission of this granule fails busy instead of reusing it. */
-	memunmap_pages(&granule->pgmap);
-	release_mem_region(granule->pgmap.range.start, SZ_2M);
-	kfree(granule);
-}
 static int compare_indices(const void *left, const void *right)
 {
 	unsigned long a = *(const unsigned long *)left, b = *(const unsigned long *)right;
@@ -109,8 +56,7 @@ struct hyper_guest_memory {
  * memunmap_pages kills admission and waits for every GUP/DMA page reference. */
 static void hyper_memory_unprepare(struct hyper_guest_memory *memory)
 {
-	unsigned int i;
-	for (i = 0; i < memory->granule_count; ++i) granule_put(memory->granules[i]);
+	hyper_granules_put(memory->granules, memory->granule_count);
 	kvfree(memory->granules); kvfree(memory->pfns);
 	memory->granules = NULL; memory->pfns = NULL; memory->granule_count = 0;
 	if (memory->dynamic) { memory->first_pfn = 0; memory->pages = 0; }
@@ -253,7 +199,7 @@ static int hyper_memory_prepare(struct hyper_guest_memory *memory,
 	acquired = kvmalloc_array(unique, sizeof(*acquired), GFP_KERNEL);
 	if (!acquired) { result = -ENOMEM; goto out; }
 	for (; ready < unique; ++ready) {
-		acquired[ready] = granule_get(indices[ready]);
+		acquired[ready] = hyper_granule_get(indices[ready]);
 		if (IS_ERR(acquired[ready])) { result = PTR_ERR(acquired[ready]); goto out; }
 	}
 	/* Publish only after every page/granule has been admitted successfully. */
@@ -264,7 +210,7 @@ static int hyper_memory_prepare(struct hyper_guest_memory *memory,
 	memory->guest_base = prepare->guest_base;
 	result = 0;
 out:
-	while (ready) granule_put(acquired[--ready]);
+	hyper_granules_put(acquired, ready);
 	kvfree(acquired); kvfree(pfns); kvfree(indices); kvfree(aliases);
 	return result;
 }
@@ -424,7 +370,26 @@ static struct platform_driver hyper_memory_driver = {
 		.suppress_bind_attrs = true,
 	},
 };
-module_platform_driver(hyper_memory_driver);
+static int __init hyper_memory_init(void)
+{
+	int result = hyper_granules_init();
+
+	if (result)
+		return result;
+	result = platform_driver_register(&hyper_memory_driver);
+	if (result)
+		hyper_granules_exit();
+	return result;
+}
+
+static void __exit hyper_memory_exit(void)
+{
+	/* Open files and VMAs pin this module until their synchronous release. */
+	platform_driver_unregister(&hyper_memory_driver);
+	hyper_granules_exit();
+}
+module_init(hyper_memory_init);
+module_exit(hyper_memory_exit);
 
 MODULE_DESCRIPTION("HypeR reserved guest RAM mappings for Linux I/O backends");
 MODULE_AUTHOR("roolrz");

@@ -76,6 +76,12 @@ jobs:
         run: python3 -B tests/io-vm/bringup.py --boot-index target/io-vm/${{ matrix.platform }}-boot.json --log target/io-vm/bringup.log
       - name: Compile the AArch64 disk fixture
         run: aarch64-linux-gnu-gcc -static -O2 -Wall -Wextra -Werror tests/io-vm/vhost-scsi.c -o target/io-vm/vhost-scsi-test
+      - name: Compile the granule retirement regression module
+        run: |
+          make -C target/io-vm/build/${{ matrix.platform }}/linux \
+            ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            M="$PWD/tests/guest-memory" \
+            MO="$PWD/target/io-vm/build/${{ matrix.platform }}/retirement-tests" modules
       - name: Verify vhost-scsi writes against the QEMU disk image
         run: |
           python3 - <<'PYTHON'
@@ -86,7 +92,8 @@ jobs:
           subprocess.run(['python3', '-B', 'tests/io-vm/verify.py',
                           '--base', base['directory'],
                           '--manifest-sha256', base['manifest_sha256'],
-                          '--test-binary', 'target/io-vm/vhost-scsi-test'], check=True)
+                          '--test-binary', 'target/io-vm/vhost-scsi-test',
+                          '--retirement-module', 'target/io-vm/build/${{ matrix.platform }}/retirement-tests/hyper_granules_test.ko'], check=True)
           PYTHON
       - name: Save incremental upstream build cache
         if: always()

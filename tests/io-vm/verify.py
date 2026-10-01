@@ -27,6 +27,8 @@ def main():
     parser.add_argument("--base", required=True, type=Path)
     parser.add_argument("--manifest-sha256", required=True)
     parser.add_argument("--test-binary", required=True, type=Path)
+    parser.add_argument("--retirement-module", type=Path,
+                        help="Optional granule retirement regression kernel module")
     parser.add_argument("--qemu", default="qemu-system-aarch64")
     parser.add_argument("--accel", choices=["tcg", "hvf", "kvm"], default="tcg")
     parser.add_argument("--log", type=Path, default=ROOT / "target/io-vm/acceptance.log")
@@ -40,6 +42,9 @@ def main():
         shutil.copyfile(args.test_binary, overlay / "usr/bin/vhost-scsi-test")
         (overlay / "init").chmod(0o755)
         (overlay / "usr/bin/vhost-scsi-test").chmod(0o755)
+        if args.retirement_module is not None:
+            (overlay / "usr/lib").mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(args.retirement_module, overlay / "usr/lib/hyper_granules_test.ko")
         result = ASSEMBLE.assemble(argparse.Namespace(
             base=args.base, manifest_sha256=args.manifest_sha256, overlay=overlay,
             output=work / "boot", architecture="aarch64", kernel_limit=32 * ASSEMBLE.MIB,
@@ -105,6 +110,9 @@ def main():
                         b"HypeR I/O: module lookup PASS" not in collected or
                         b"HypeR I/O: acceptance complete" not in collected):
                     raise RuntimeError(f"I/O VM acceptance failed; see {args.log}")
+                if (args.retirement_module is not None and
+                        b"HypeR granule retirement tests: PASS" not in collected):
+                    raise RuntimeError(f"Granule retirement regressions failed; see {args.log}")
                 # Check backing storage independently of the frontend readback.
                 with disk.open("rb") as source_disk:
                     source_disk.seek(8 * 512)
