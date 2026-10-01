@@ -98,6 +98,24 @@ and writes a guest-origin quiescence proof. Only then may Native ownership
 release the mapping and flush stage-2 translations. The register and bootstrap
 formats are documented in [README](README.md#board-volume-deployments).
 
+Final metadata users leave the shared granule registry under its mutex. The
+driver retires at most 32 entries from each caller's existing array at a time,
+using a dedicated unbound reclaim-capable workqueue. Independent
+`memunmap_pages` calls overlap their reference and RCU waits; upstream Linux
+still owns all page-reference, memory-hotplug and RCU synchronization. Shared
+granules stay registered until their last grant releases them. A retiring
+granule retains its physical resource claim until unmapping completes, so a
+concurrent admission receives `EBUSY` instead of reusing live metadata.
+
+Each caller joins every queued callback before freeing its granules and array
+or acknowledging release. Workers take no grant or registry mutex, and work
+items are embedded in metadata allocated during admission. Release and failed
+admission rollback therefore need no per-release work-item allocations. Under
+memory pressure the workqueue rescuer may serialize completion; safety does not
+depend on parallel progress. The queue's active-work limit is 32 for the
+current non-NUMA appliances. Driver unregister precedes queue destruction,
+and open files and mappings retain the module throughout synchronous cleanup.
+
 A successful mmap or shared-memory copy is insufficient validation: actual
 vhost scatterlists and device DMA must be exercised. Device alignment constraints
 may still require bounce buffers; no end-to-end zero-copy claim follows solely

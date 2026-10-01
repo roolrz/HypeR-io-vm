@@ -55,7 +55,8 @@ class Publication(unittest.TestCase):
                          'sha256': FIXTURE.ASSEMBLE.sha256(self.source_entries['upstream/' + filename])}
                          for name, filename in [('linux', 'linux.tar.xz'), ('busybox', 'busybox.tar.bz2')]})
         module_paths = ['include/hyper_io.h', 'include/hyper_io_layout.h', 'modules/guest-memory/Makefile',
-                        'modules/guest-memory/hyper_guest_memory.c', 'modules/io-bridge/Makefile',
+                        'modules/guest-memory/memory.c', 'modules/guest-memory/granules.c',
+                        'modules/guest-memory/granules.h', 'modules/io-bridge/Makefile',
                         'modules/io-bridge/hyper_io_bridge.c']
         metadata['external_module_source_sha256'] = FIXTURE.ASSEMBLE.sha256(
             ''.join(metadata['source_files'][name] for name in module_paths).encode())

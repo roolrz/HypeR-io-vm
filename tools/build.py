@@ -178,7 +178,8 @@ def main():
     if digest(checkout / "include/hyper_io.h") != digest(ROOT / "include/hyper_io.h"):
         raise ValueError("module checkout and service bridge headers differ")
     module_paths = ["include/hyper_io.h", "include/hyper_io_layout.h", "modules/guest-memory/Makefile",
-                    "modules/guest-memory/hyper_guest_memory.c", "modules/io-bridge/Makefile",
+                    "modules/guest-memory/memory.c", "modules/guest-memory/granules.c",
+                    "modules/guest-memory/granules.h", "modules/io-bridge/Makefile",
                     "modules/io-bridge/hyper_io_bridge.c"]
     input_hashes = {name: digest(checkout / name) for name in module_paths}
     source_dirty |= any(input_hashes[name] != digest(ROOT / name) for name in module_paths)
@@ -192,12 +193,11 @@ def main():
     module_identity = None
     if args.module_source:
         checkout = args.module_source.resolve()
-        source_files = [checkout / "include/hyper_io.h", checkout / "include/hyper_io_layout.h"]
+        source_files = [checkout / name for name in module_paths]
         for name, basename in (("guest-memory", "hyper_guest_memory"), ("io-bridge", "hyper_io_bridge")):
             module_source = checkout / "modules" / name
             module_output = build / "modules" / name
             module_output.mkdir(parents=True, exist_ok=True)
-            source_files.extend([module_source / "Makefile", module_source / f"{basename}.c"])
             run(linux_make + [f"M={module_source}", f"MO={module_output}", f"-j{args.jobs}", "modules"], env=environment)
             module = module_output / f"{basename}.ko"
             vermagic = subprocess.check_output(["modinfo", "-F", "vermagic", str(module)], text=True).split()

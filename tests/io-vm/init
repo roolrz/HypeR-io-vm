@@ -16,6 +16,10 @@ if modprobe hyper_intentionally_missing_module >/dev/null 2>&1; then
     exit 1
 fi
 echo 'HypeR I/O: module lookup PASS'
+if test -f /usr/lib/hyper_granules_test.ko; then
+    insmod /usr/lib/hyper_granules_test.ko
+    rmmod hyper_granules_test
+fi
 
 core=/sys/kernel/config/target/core/iblock_0/hyper-test
 target=/sys/kernel/config/target/vhost/naa.5001405000000001
