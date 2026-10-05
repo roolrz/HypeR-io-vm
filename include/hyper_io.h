@@ -5,7 +5,7 @@
 #include <linux/types.h>
 #include <linux/ioctl.h>
 #define HYPER_IO_MAGIC 0x314f4948U
-#define HYPER_IO_VERSION 2
+#define HYPER_IO_VERSION 3
 #define HYPER_IO_QUEUES 6
 #define HYPER_IO_RECORD 256
 #define HYPER_IO_MAX_GRANT_PAGES (1U << 20)
@@ -16,6 +16,11 @@
 #define HYPER_IO_STOP_QUEUE 4
 #define HYPER_IO_PREPARE_MEMORY 5
 #define HYPER_IO_RELEASE_MEMORY 6
+#define HYPER_IO_NETWORK_HELLO 7
+#define HYPER_IO_NETWORK_ACTIVATE 8
+#define HYPER_IO_NETWORK_RESET 9
+#define HYPER_IO_NETWORK_STOP_QUEUE 10
+#define HYPER_IO_NETWORK_QUEUES 2
 #define HYPER_IO_OK 0
 #define HYPER_IO_UNSUPPORTED 1
 #define HYPER_IO_INVALID 2
@@ -47,11 +52,39 @@ struct hyper_io_reply {
 	__le64 features;
 	__le32 queues, queue_max;
 };
+struct hyper_io_network_activate {
+	struct hyper_io_header header;
+	__le64 features;
+	struct hyper_io_queue queues[HYPER_IO_NETWORK_QUEUES];
+};
+struct hyper_io_network_reply {
+	struct hyper_io_reply common;
+	__u8 mac[6];
+	__le16 mtu;
+	__le64 reserved;
+};
 /* Linux-local control ABI. File descriptor numbers never cross the VM boundary. */
 struct hyper_io_eventfds {
 	__u32 epoch, reserved;
 	__s32 kick[HYPER_IO_QUEUES], call[HYPER_IO_QUEUES];
 };
+/* Network has exactly RX/TX; SCSI requires control/event/request queues and
+ * permits three more request queues. Unused descriptors must be paired -1. */
+static inline int hyper_io_eventfds_valid(const struct hyper_io_eventfds *fds,
+					 int network)
+{
+	unsigned required = network ? HYPER_IO_NETWORK_QUEUES : 3;
+	unsigned maximum = network ? HYPER_IO_NETWORK_QUEUES : HYPER_IO_QUEUES;
+	for (unsigned i = 0; i < HYPER_IO_QUEUES; ++i) {
+		int absent = fds->kick[i] == -1 && fds->call[i] == -1;
+		if (i >= maximum || (i >= required && absent)) {
+			if (!absent)
+				return 0;
+		} else if (fds->kick[i] < 0 || fds->call[i] < 0)
+			return 0;
+	}
+	return 1;
+}
 struct hyper_memory_info {
 	__u64 guest_base, length;
 };

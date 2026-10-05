@@ -55,6 +55,8 @@ jobs:
         run: |
           gcc -O2 -Wall -Wextra -Werror -Iinclude tests/io-vm/control.c -o /tmp/hyper-control-test
           /tmp/hyper-control-test
+          gcc -O2 -Wall -Wextra -Werror -Iinclude tests/io-vm/retirement.c -o /tmp/hyper-retirement-test
+          /tmp/hyper-retirement-test
       - name: Build the pinned upstream kernel, BusyBox, and external module
         id: kernel-build
         run: make base PLATFORM=${{ matrix.platform }} CROSS_COMPILE=aarch64-linux-gnu- JOBS=4

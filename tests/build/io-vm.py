@@ -7,17 +7,22 @@
 import gzip
 import importlib.util
 import json
+import os
 from pathlib import Path
 import stat
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location("assemble_io_vm", ROOT / "scripts/assemble-io-vm.py")
 ASSEMBLE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ASSEMBLE)
+BUILD_SPEC = importlib.util.spec_from_file_location("build_io_vm", ROOT / "tools/build.py")
+BUILD = importlib.util.module_from_spec(BUILD_SPEC)
+BUILD_SPEC.loader.exec_module(BUILD)
 
 
 def directory():
@@ -26,6 +31,26 @@ def directory():
 
 def regular(contents, mode=0o644):
     return (stat.S_IFREG | mode, 0, 0, 0, 0, contents)
+
+
+class BuildVersion(unittest.TestCase):
+    def test_banner_identifies_appliance_without_changing_linux_release(self):
+        revision = "0123456789abcdef" * 2 + "01234567"
+        with patch.dict(os.environ, {"SOURCE_DATE_EPOCH": "0"}):
+            timestamp = BUILD.build_timestamp()
+        self.assertEqual(timestamp, "1970-01-01T00:00:00Z")
+        self.assertEqual(BUILD.version_banner(revision, True, "rpi5", timestamp),
+                         "HypeR I/O VM version 0123456789ab-dirty (rpi5; built 1970-01-01T00:00:00Z)\n")
+        self.assertNotIn("-dirty", BUILD.version_banner(revision, False, "qemu", timestamp))
+
+    def test_default_timestamp_is_build_time_and_invalid_epoch_is_rejected(self):
+        with patch.dict(os.environ, {}, clear=True):
+            timestamp = BUILD.build_timestamp()
+        self.assertRegex(timestamp, r"^20\d\d-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        for epoch in ("", "-1", "not-a-date", "1.5", "١"):
+            with self.subTest(epoch=epoch), patch.dict(os.environ, {"SOURCE_DATE_EPOCH": epoch}):
+                with self.assertRaises(ValueError):
+                    BUILD.build_timestamp()
 
 
 class Archives(unittest.TestCase):

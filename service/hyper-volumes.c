@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 roolrz
 // SPDX-License-Identifier: Apache-2.0
 #define _GNU_SOURCE
+#include "hyper_network.h"
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -103,25 +104,23 @@ bad:
 	errno = EINVAL;
 	return -1;
 }
-/* Bootstrap authorization, never a client-supplied target or device path. */
+/* Bootstrap authorization; device policies never come from guest messages. */
 static int clients(const char *path)
 {
 	FILE *f = fopen(path, "r");
-	char line[128];
-	unsigned ids[128];
-	unsigned indices[128];
-	unsigned n = 0;
+	char line[160], network[128][32], mac[128][18];
+	unsigned ids[128], indices[128], n = 0;
 	if (!f)
 		return -1;
-	if (!fgets(line, sizeof(line), f) || strcmp(line, "hyper.clients.v1\n"))
+	if (!fgets(line, sizeof(line), f) || strcmp(line, "hyper.clients.v2\n"))
 		goto bad;
 	while (fgets(line, sizeof(line), f)) {
-		char id[8];
-		char volume[32];
-		char extra;
-		unsigned index;
+		char id[8], volume[32], extra;
+		unsigned index = count;
+		unsigned char address[6];
 		if (n == 128 || !strchr(line, '\n') ||
-		    sscanf(line, "%7s %31s %c", id, volume, &extra) != 2)
+		    sscanf(line, "%7s %31s %31s %17s %c", id, volume,
+			   network[n], mac[n], &extra) != 4)
 			goto bad;
 		for (char *p = id; *p; ++p)
 			if (!isdigit((unsigned char)*p))
@@ -129,14 +128,25 @@ static int clients(const char *path)
 		unsigned client = strtoul(id, NULL, 10);
 		if (client >= 128)
 			goto bad;
-		for (index = 0; index < count; ++index)
-			if (!strcmp(volume, volumes[index].name))
-				break;
-		if (index == count || (index == 0 && client != 0) ||
-		    (client == 0 && index != 0))
+		int net = strcmp(network[n], "-") != 0;
+		if ((net && (!token(network[n]) ||
+			     hyper_mac_parse(mac[n], address))) ||
+		    (!net && strcmp(mac[n], "-")))
+			goto bad;
+		if (strcmp(volume, "-")) {
+			for (index = 0; index < count; ++index)
+				if (!strcmp(volume, volumes[index].name))
+					break;
+			if (index == count)
+				goto bad;
+		}
+		if ((!client && (index != 0 || net)) ||
+		    (client && index == 0) || (index == count && !net))
 			goto bad;
 		for (unsigned i = 0; i < n; ++i)
-			if (ids[i] == client || indices[i] == index)
+			if (ids[i] == client ||
+			    (index != count && indices[i] == index) ||
+			    (net && !strcmp(mac[i], mac[n])))
 				goto bad;
 		ids[n] = client;
 		indices[n++] = index;
@@ -150,10 +160,15 @@ static int clients(const char *path)
 	if (!config)
 		goto bad;
 	fclose(f);
-	/* No output before every authorization and duplicate check has passed.
-	 */
-	for (unsigned i = 0; i < n; ++i)
-		printf("%u naa.5001405%09x\n", ids[i], indices[i] + 1);
+	/* Publish nothing before the whole authorization table passes
+	 * validation. */
+	for (unsigned i = 0; i < n; ++i) {
+		if (indices[i] == count)
+			printf("%u -", ids[i]);
+		else
+			printf("%u naa.5001405%09x", ids[i], indices[i] + 1);
+		printf(" %s %s\n", network[i], mac[i]);
+	}
 	return ferror(stdout) ? -1 : 0;
 bad:
 	fclose(f);
@@ -367,16 +382,17 @@ static int create_volume(int control, const struct volume *v)
 	if (mknod(path, S_IFBLK | 0600, dev))
 		goto bad;
 	return 0;
-bad: {
-	/* mknod may have failed because an unrelated node already exists. Only
-	 * the mapping created by this call belongs to rollback; never unlink
-	 * that node. */
-	int saved = errno;
-	if (ioctl(control, DM_DEV_REMOVE, request(&buffer, v->mapper)))
-		perror("rollback mapping");
-	errno = saved;
-	return -1;
-}
+bad:
+	{
+		/* mknod may have failed because an unrelated node already
+		 * exists. Only the mapping created by this call belongs to
+		 * rollback; never unlink that node. */
+		int saved = errno;
+		if (ioctl(control, DM_DEV_REMOVE, request(&buffer, v->mapper)))
+			perror("rollback mapping");
+		errno = saved;
+		return -1;
+	}
 }
 int main(int argc, char **argv)
 {
