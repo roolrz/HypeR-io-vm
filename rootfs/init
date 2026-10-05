@@ -6,6 +6,8 @@ export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev
+# Build identification is diagnostic; a missing banner must not prevent boot.
+cat /etc/hyper-io-version || true
 role=unset
 test_mode=none
 mode=attached
@@ -78,6 +80,9 @@ if [ "$mode" = attached ] || [ -f /etc/hyper-clients.conf ]; then
 fi
 insmod "/lib/modules/$(uname -r)/hyper_io_bridge.ko"
 mount -t configfs configfs /sys/kernel/config
+if [ -f /etc/hyper-networks.conf ]; then
+    /usr/bin/hyper-networks /etc/hyper-networks.conf
+fi
 if [ -f /etc/hyper-clients.conf ]; then
     /usr/bin/hyper-volumes clients /etc/hyper-volumes.conf /etc/hyper-clients.conf > /run/hyper-client-plan
 fi

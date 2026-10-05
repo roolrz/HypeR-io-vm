@@ -7,8 +7,8 @@ This repository owns the complete Linux I/O appliance: upstream source locks,
 kernel configuration, external modules, Linux userspace services, initramfs,
 backend tests, and package publication. HypeR owns Native apps, DTS/DTB,
 virtual hardware, and launch policy. HypeR imports a digest-pinned package;
-it does not rebuild Linux. Its board packager adds versioned bootstrap volume
-and client manifests to the imported rootfs; executable Linux components remain
+it does not rebuild Linux. Its board packager adds versioned bootstrap volume,
+client and network manifests to the imported rootfs; executable Linux components remain
 owned and built here.
 
 The base initramfs includes BusyBox's full `modprobe`, the matching kernel's
@@ -38,21 +38,33 @@ qualified workflow; pushing a development branch never publishes an appliance.
 ## Validation boundaries
 
 The kernel workflow builds the pinned upstream kernel and both external modules,
-checks control transactions, boots the business appliance and runs real-disk
+checks storage/network control transactions and injected retirement failures,
+boots the business appliance and runs real-disk
 vhost-scsi/LIO write/flush/read verification. HypeR's integration tests separately
 exercise the cross-VM Native ownership and notification paths. A Linux-only
 acceptance result does not prove those paths or Pi 5 physical DMA.
 
-Board volume deployment adds dm-linear ownership, managed clients, Native config
-storage and dynamic scatter grants. Their complete HypeR boot, mount, guest I/O
-and teardown qualification must pass before publishing this development version.
-Pi 5 still requires hardware qualification of its DMA, firmware and reset paths.
+Board deployment adds dm-linear ownership, managed clients, Native config
+storage, dynamic scatter grants and guest networking. HypeR separately checks
+DHCP, HTTP integrity, independent network reset, VM restart and shared-memory
+retirement through its virtio-net frontend. These cross-VM checks qualify an
+exact package for HypeR adoption; automatic prerelease publication does not
+establish that result. Pi 5 still requires hardware qualification of its
+physical network, DMA, firmware and reset paths.
 
-## Target storage protocol and control ownership
+## Device protocol and control ownership
 
-The guest-facing device uses modern virtio-mmio and standard virtio-scsi. Linux
-vhost-scsi/LIO consumes the shared virtqueues. Neither vm-runtime nor the Linux
-management service forwards individual storage requests.
+The guest-facing devices use modern virtio-mmio with standard virtio-scsi and
+virtio-net. Linux vhost-scsi/LIO and vhost-net consume the shared virtqueues.
+Neither vm-runtime nor the Linux management service forwards individual disk
+requests or packets.
+
+Linux creates an unnumbered bridge and attaches the board-selected uplink
+during appliance startup. Network activation creates a separate TAP for each
+guest, attaches it to that bridge and connects its RX/TX queues to vhost-net.
+QEMU user networking supplies the QEMU uplink's DHCP/NAT; Pi 5's RP1 Ethernet
+uplink reaches an external LAN. The appliance supplies no DHCP server or IP
+router, and Native client zero has no active network endpoint.
 
 Configuration MMIO uses a bounded per-vCPU request, published after hardware
 detach and completed through the owning vCPU capability. Reading a request is
@@ -189,13 +201,52 @@ cache maintenance, interrupt ordering, device reset, and measured image sizes.
 
 ## Four-request-queue bridge generation
 
-Bridge protocol version 2 has six queue records in its 240-byte ACTIVATE
+Bridge protocol version 3 retains six queue records in its 240-byte ACTIVATE
 message: control, event, and four request queues. HELLO advertises six queues.
 The first three queues are mandatory; optional request queues use all-zero
 records when a driver does not configure them. Each configured queue has its
 own kick/call eventfds. RESET and STOP_QUEUE still clear the entire vhost
 endpoint and drain all producers before notification unbind or memory release.
-Version 1 peers are rejected; HypeR must adopt the matching immutable package.
+Earlier protocol versions are rejected; HypeR must adopt the matching immutable package.
 The Linux acceptance fixture exercises all four request queues against its
 real QEMU block device. Cross-VM qualification additionally checks batched
 requests, notification delivery and retirement in HypeR.
+
+
+## Shared memory with independent device lifecycles
+
+One service owns a client's admitted guest-memory mapping and control mailbox.
+Its storage and network endpoints borrow the mapping; neither endpoint may
+release it independently. `memory.c` owns admission/mapping/retirement;
+`vhost.c` validates ring extents and configures queue eventfds; `network.c`
+owns TAP and vhost-net lifecycle. Control dispatch owns the single transaction
+sequence and exact-reply replay cache.
+
+Version 3 retains operations 1–6 for storage and shared memory, and adds:
+
+| Operation | Request bytes | Successful reply bytes |
+| --- | ---: | ---: |
+| NETWORK_HELLO (7) | 40 | 80 |
+| NETWORK_ACTIVATE (8) | 112 | 48 |
+| NETWORK_RESET (9) | 40 | 48 |
+| NETWORK_STOP_QUEUE (10) | 48 | 48 |
+
+Network HELLO appends six MAC bytes, a little-endian 16-bit MTU and eight zero
+reserved bytes to the existing 64-byte capabilities reply. Network ACTIVATE
+has the same 48-byte header/features prefix followed by two 32-byte queue
+records. Its queues are mandatory and have a maximum size of 128.
+
+Binding identity and transaction numbers are client-wide. Queue epochs are
+separate for storage and network. The primary endpoint is storage when present,
+otherwise network; its HELLO admits a fresh binding, and shared-memory commands
+use its epoch. The other endpoint negotiates within that binding. A stale epoch
+or replay may not modify another endpoint. Resetting one endpoint retains shared
+RAM and the other's queues. RELEASE_MEMORY retires the binding after both drains.
+
+Storage drains with `VHOST_SCSI_CLEAR_ENDPOINT`; network drains with
+`VHOST_RESET_OWNER`, which synchronously stops and flushes both RX and TX before
+closing its vhost fd. Notifications and eventfds retire after producers, and the
+TAP is then closed. Shared-memory unmapping and the authenticated quiescence
+proof occur only after both drains succeed. The deterministic Linux retirement
+test injects failures into each drain and verifies that memory/proof retention
+and retry obey this ordering.

@@ -5,6 +5,7 @@
 """Build a pinned, unmodified upstream Linux kernel and minimal base initramfs."""
 
 import argparse
+from datetime import datetime, timezone
 import gzip
 import hashlib
 import importlib.util
@@ -24,6 +25,19 @@ ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("io_archive", ROOT / "scripts/assemble-io-vm.py")
 ARCHIVE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ARCHIVE)
+
+
+def build_timestamp():
+    epoch = os.environ.get("SOURCE_DATE_EPOCH")
+    if epoch is not None and (not epoch.isascii() or not epoch.isdecimal()):
+        raise ValueError("SOURCE_DATE_EPOCH must be a nonnegative Unix timestamp")
+    now = datetime.now(timezone.utc) if epoch is None else datetime.fromtimestamp(int(epoch), timezone.utc)
+    return now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def version_banner(revision, dirty, platform_name, timestamp):
+    version = revision[:12] + ("-dirty" if dirty else "")
+    return f"HypeR I/O VM version {version} ({platform_name}; built {timestamp})\n"
 
 
 def digest(path):
@@ -145,6 +159,7 @@ def main():
         parser.error("kernel and module builds require a Linux build host; use --fetch-only on other hosts")
     if args.jobs <= 0:
         parser.error("--jobs must be positive")
+    timestamp = build_timestamp()
     build = output / "build" / args.platform
     linux_output, busybox_output = build / "linux", build / "busybox"
     build.mkdir(parents=True, exist_ok=True)
@@ -184,7 +199,9 @@ def main():
     input_hashes = {name: digest(checkout / name) for name in module_paths}
     source_dirty |= any(input_hashes[name] != digest(ROOT / name) for name in module_paths)
     for name in ("Makefile", "tools/build.py", "scripts/assemble-io-vm.py", "rootfs/init",
-                 "service/hyper-io-service.c", "service/hyper-volumes.c", "service/hyper-io-supervisor.c", "include/hyper_io_session.h", "include/hyper_io_layout.h", "tests/io-vm/business-disk.c", "sources.lock.json",
+                 "service/hyper-io-service.c", "service/backend.h", "service/memory.c",
+                 "service/vhost.c", "service/network.c", "service/network-config.c",
+                 "service/hyper-networks.c", "include/hyper_network.h", "service/hyper-volumes.c", "service/hyper-io-supervisor.c", "include/hyper_io_session.h", "include/hyper_io_layout.h", "tests/io-vm/business-disk.c", "sources.lock.json",
                  "configs/linux-aarch64.config", "configs/busybox.config", "LICENSE", "LICENSES/GPL-2.0-only.txt"):
         input_hashes[name] = digest(ROOT / name)
     if args.platform == "rpi5":
@@ -208,11 +225,17 @@ def main():
     binaries = []
     for source, name in (("service/hyper-io-service.c", "hyper-io-service"),
                          ("service/hyper-volumes.c", "hyper-volumes"),
+                         ("service/hyper-networks.c", "hyper-networks"),
                          ("service/hyper-io-supervisor.c", "hyper-io-supervisor"),
                          ("tests/io-vm/business-disk.c", "hyper-disk-test")):
         binary = build / name
+        extra = []
+        if name == "hyper-io-service":
+            extra = [ROOT / "service" / part for part in ("memory.c", "vhost.c", "network.c", "network-config.c")]
+        elif name == "hyper-networks":
+            extra = [ROOT / "service/network-config.c"]
         run([args.cross_compile + "gcc", "-static", "-O2", "-Wall", "-Wextra", "-Werror",
-             "-I", str(ROOT / "include"), str(ROOT / source), "-o", str(binary)], env=environment)
+             "-I", str(ROOT / "include"), str(ROOT / source), *map(str, extra), "-o", str(binary)], env=environment)
         binaries.append(binary)
 
     busybox_make = ["make", "-C", str(sources["busybox"]), f"O={busybox_output}", "ARCH=arm64",
@@ -239,6 +262,8 @@ def main():
             stdout=subprocess.DEVNULL)
         for name in ("dev", "proc", "sys", "run", "tmp", "etc/target", f"lib/modules/{release}"):
             (rootfs / name).mkdir(parents=True, exist_ok=True)
+        (rootfs / "etc/hyper-io-version").write_text(
+            version_banner(source_revision, source_dirty, args.platform, timestamp))
         for module in modules:
             shutil.copyfile(module, rootfs / "lib/modules" / release / module.name)
         # Built-in drivers can still be requested through request_module().
@@ -271,6 +296,7 @@ def main():
         manifest = {"format": 1, "architecture": "aarch64", "platform": args.platform,
                     "kernel_release": release, "source_lock": lock,
                     "source_revision": source_revision, "source_dirty": source_dirty,
+                    "build_timestamp": timestamp,
                     "source_files": input_hashes,
                     "external_module_source_sha256": module_identity,
                     "kernel_config_sha256": digest(linux_output / ".config"),

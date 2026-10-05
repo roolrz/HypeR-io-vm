@@ -56,6 +56,7 @@ struct bridge {
 	atomic_t opened;
 	atomic64_t irq_generation;
 	bool mailbox;
+	bool network;
 	int irq;
 	struct eventfd_ctx *kick[HYPER_IO_QUEUES];
 	struct call_binding call[HYPER_IO_QUEUES];
@@ -241,6 +242,7 @@ static long notification_ioctl(struct file *file, unsigned int command,
 		goto out;
 	}
 	if (!fds.epoch || fds.reserved ||
+	    !hyper_io_eventfds_valid(&fds, bridge->network) ||
 	    fds.epoch != readl(bridge->base + 0x08) ||
 	    readl(bridge->base + 0x0c)) {
 		result = -EINVAL;
@@ -252,7 +254,7 @@ static long notification_ioctl(struct file *file, unsigned int command,
 		struct call_binding *call = &bridge->call[i];
 		struct call_poll poll = {.call = call};
 		__poll_t ready;
-		if (i >= 3 && fds.kick[i] == -1 && fds.call[i] == -1)
+		if (fds.kick[i] == -1)
 			continue;
 		bridge->kick[i] = eventfd_ctx_fdget(fds.kick[i]);
 		if (IS_ERR(bridge->kick[i])) {
@@ -509,6 +511,7 @@ static int bridge_probe(struct platform_device *device)
 	bridge->misc.minor = MISC_DYNAMIC_MINOR;
 	{
 		u32 client;
+		const char *kind = NULL;
 		const char *base = bridge->mailbox ? "hyper-io-control"
 						   : "hyper-io-notification";
 		if (of_find_property(device->dev.of_node, "hyper,client-id",
@@ -519,8 +522,21 @@ static int bridge_probe(struct platform_device *device)
 				result = -EINVAL;
 				goto free_irq;
 			}
+			if (of_find_property(device->dev.of_node,
+					     "hyper,device-kind", NULL)) {
+				if (bridge->mailbox ||
+				    of_property_read_string(device->dev.of_node,
+							    "hyper,device-kind",
+							    &kind) ||
+				    strcmp(kind, "network")) {
+					result = -EINVAL;
+					goto free_irq;
+				}
+				bridge->network = true;
+			}
 			bridge->misc.name =
-			    kasprintf(GFP_KERNEL, "%s-%u", base, client);
+			    kasprintf(GFP_KERNEL, "%s-%u%s", base, client,
+				      kind ? "-net" : "");
 		} else
 			bridge->misc.name = kstrdup(base, GFP_KERNEL);
 		if (!bridge->misc.name) {

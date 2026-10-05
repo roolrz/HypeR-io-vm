@@ -3,12 +3,21 @@
 
 # HypeR I/O VM
 
-A Linux appliance under development for HypeR's virtio-scsi storage backend. This repository
+A Linux appliance under development for HypeR's virtio-scsi storage and
+virtio-net guest networking backends. This repository
 owns Linux builds, external drivers, Linux-side services, complete initramfs
 assembly, tests, and GHCR package publication. HypeR owns Native apps and DTS.
 
 Linux is pinned to upstream **6.18.51 LTS** without source patches.
 Hyper-specific drivers build as external `.ko` modules.
+
+At boot, the appliance prints its own Git revision (12 hexadecimal digits),
+an optional `-dirty` suffix, build profile, and UTC build time. The same line
+is available in `/etc/hyper-io-version`; the base manifest records the full
+revision, dirty state and `build_timestamp`. Uncommitted tracked changes,
+untracked source files, or different external module sources mark the build
+dirty. Set `SOURCE_DATE_EPOCH` to a nonnegative Unix timestamp for a reproducible
+appliance banner. The upstream Linux release and module ABI remain unchanged.
 
 ## Build
 
@@ -44,11 +53,16 @@ use that role only with a disposable acceptance disk. Missing roles power off.
 The base remains available separately for isolated Linux fixtures.
 
 The control service handles setup/reset only. Queue kicks and completions use
-kernel eventfd bindings, while vhost-scsi handles requests directly. Reset
-acknowledges only after endpoint drain and callback detach; a failed drain
+kernel eventfd bindings, while vhost-scsi and vhost-net process shared queues.
+Reset acknowledges only after endpoint drain and callback detach; a failed drain
 retains its resources. Service exit powers off the I/O VM so its Native owner
 can quiesce DMA before releasing imported memory. Cross-VM qualification is
 still required before publishing a production package.
+
+The current control protocol is version 3, including shared storage/network
+memory ownership. HypeR must use the matching Native control plane and package
+generation. An older notification module cannot distinguish the two device
+kinds for one client and can fail probe with duplicate device names.
 
 ## Package delivery
 
@@ -63,7 +77,10 @@ required. A successful main push build triggers publication of that exact run's
 artifact, using version `main-<commit>-run<run-id>-attempt<attempt>`. Failed or
 cancelled builds, PRs, and manual build runs do not auto-publish. The publication
 summary and `published-reference` artifact contain the digest. HypeR's lockfile
-is updated separately after cross-VM qualification.
+is updated separately after cross-VM qualification of those exact QEMU and
+Pi 5 digests. The Pi 5 image-distribution repository then selects the merged
+HypeR revision and inherits its appliance pins. A local boot-generation
+directory is suitable for development tests, not a published release identity.
 
 Manual build and qualified publication remain available:
 
@@ -134,11 +151,15 @@ identity, capacity and logical sector size before creating any dm-linear volume.
 Each volume receives its own LIO target; volume N uses `naa.5001405%09x` with N
 starting at 1. The appliance does not mount these filesystems, scan guest GPTs,
 or run udev, LVM, RAID discovery or automatic filesystem activation. Linux LIO
-claims the mapped block devices while exporting them. `/etc/hyper-clients.conf` begins with `hyper.clients.v1`, followed by
-`client-id volume-name` lines. Client 0 exclusively owns `config`. Duplicate
-client IDs and duplicate volume assignments are rejected before creating any
-exports. Each authorized client receives a separate service process, vhost fd,
-LIO target, memory mapping, mailbox and notification device.
+claims the mapped block devices while exporting them. `/etc/hyper-clients.conf` begins with `hyper.clients.v2`, followed by
+`client-id volume-name network-name mac-address` lines. A missing volume or
+network uses `-`; without a network the MAC is also `-`. Client 0 exclusively
+owns `config` and reserves the Native network endpoint without creating a TAP
+or establishing a Native network link. Duplicate client IDs, volume assignments
+and MAC addresses are rejected before creating exports. Each authorized client
+receives one service process, memory mapping and mailbox. Storage and network
+have separate vhost fds, notification devices and reset epochs. A client can use
+storage, networking, or both.
 
 Shutdown drains vhost before removing LIO exports and dm mappings. A failed
 vhost drain retains mappings until the host quarantines and destroys the I/O VM.
@@ -154,14 +175,16 @@ aperture; they are not declared as Linux RAM and allocate neither host backing
 nor Linux page metadata at boot. PREPARE registers only the authorized actual
 extent using upstream `MEMORY_DEVICE_GENERIC` / `memremap_pages`. Dynamic
 grants retain 4 KiB page granularity; shared 2 MiB device-page metadata is
-created on demand and reference-counted across grants. The config pool remains
-128 KiB. A client is bounded to 1,048,576 pages (4 GiB).
+created on demand and reference-counted across grants. The current HypeR Native
+configuration client supplies a 1 MiB static pool; its extent comes from the
+guest DT. A client is bounded to 1,048,576 pages (4 GiB).
 The alias uses a fixed affine translation of the host physical address,
 represented by standard dma-ranges without rewriting device DMA operations. The HypeR owner excludes
 its I/O VM RAM and static translated pools from that translated range, and must
 ensure the aperture fits Linux's linear-map window and avoids guest MMIO.
 
-Managed sessions add two version-1 control operations. `PREPARE_MEMORY` (5) is a
+Managed sessions use protocol version 3's shared-memory operations.
+`PREPARE_MEMORY` (5) is a
 72-byte record: the existing 40-byte header followed by little-endian alias
 physical address, frontend GPA base, byte length and mapping token. The HypeR owner installs the actual pages first; the
 service maps only this length, bounded by its DTB window. `RELEASE_MEMORY` (6)
@@ -172,7 +195,7 @@ virtio device reset. Reusing a released slot with a new binding requires HELLO
 and a strictly increasing binding generation. A new notification route may restart
 its queue epoch at one; epochs remain monotonic within one binding. Delayed
 requests from old binding generations are rejected.
-Older appliances reject the new operations; callers must fail rather than use
+Incompatible appliances must fail setup rather than use
 an unsafe whole-window fallback. Individual normally closed clients retire
 without stopping other services; the owner must keep a slot mailbox alive when
 it intends to reuse that slot via RELEASE/PREPARE.
@@ -211,7 +234,13 @@ admission; it is not part of the storage data path.
 and BusyBox sources, using separate build and publication identities. Main
 builds and publishes both matrix entries as `-aarch64-qemu` and
 `-aarch64-rpi5`; each package includes its own resolved configs and matching
-source archive. The Pi 5 profile adds the existing board driver configuration.
+source archive. The Pi 5 profile includes SDHCI and its clock/GPIO/pinctrl
+dependencies, plus the generic PCI host, GICv2m, RP1 PCI, RP1 clock/GPIO, MACB
+and Broadcom PHY drivers. HypeR supplies a virtual PCI host for the assigned
+whole RP1 function; Linux owns RP1's interrupt controller and peripherals.
+The physical BCM2712 PCIe transport, resource claims and MSI routing remain
+with HypeR. This is a trusted-driver deployment without IOMMU DMA isolation;
+RP1 peripherals cannot be split across independent owners.
 Running it on QEMU checks guest boot, not physical devices or DMA.
 
 For initial Pi 5 guest bring-up, HypeR may select
@@ -224,3 +253,41 @@ use `standby` or `attached`; bring-up is never an automatic error fallback.
 Sharing this repository does not relicense Linux, BusyBox or the GPL bridge
 modules. Both binary variants retain the same corresponding-source and notice
 requirements described above.
+
+### Guest networking
+
+The board supplies `/etc/hyper-networks.conf`: its first line is
+`hyper.networks.v1`; subsequent lines contain `network-name bridge uplink`, for
+example `default hbr0 eth0`. An empty table leaves networking disabled. Bootstrap
+creates Linux bridges without assigning IP addresses. In QEMU the passed-through
+virtio-net uplink connects to QEMU user networking, which supplies DHCP and NAT.
+The guest uses the bridged link directly; HypeR Native has no network stack or
+active network endpoint. On Pi 5, the same bridge uses RP1 GEM as its physical
+uplink, forwarding guest MAC addresses onto the LAN. The LAN supplies DHCP
+and routing. The physical uplink inventory remains board-owned; physical Pi 5
+networking and DMA retirement still require hardware qualification.
+
+Bridge creation and uplink attachment run automatically from `/init`, before
+the backend services start. Each guest's network startup is separate: the
+Alpine image built by HypeR starts its own DHCP client. The appliance's
+`network default ready on eth0` message confirms local bridge setup, not
+external connectivity or a guest DHCP lease.
+
+A configured business client owns one nonpersistent TAP, attached only when
+its virtio-net device activates. `vhost-net` serves RX queue 0 and TX queue 1.
+The frontend offers modern virtio and a fixed locally administered MAC; checksum
+and segmentation offloads, mergeable RX buffers, control queues and multiqueue
+are not offered. The MTU is 1500. This is a shared Ethernet segment, not a network
+isolation or anti-spoofing policy.
+
+The TAP carries Ethernet frames without a virtio header. vhost's private
+`VHOST_NET_F_VIRTIO_NET_HDR` feature supplies/consumes the modern 12-byte header;
+this backend-only feature is never offered to guests. Device reset drains only
+that device. `RELEASE_MEMORY` drains both devices before unmapping RAM and
+acknowledging the grant's retirement. Failure of either drain retains the mapping
+and withholds the retirement proof.
+
+Network notifications carry `hyper,device-kind = "network"` beside
+`hyper,client-id`, producing `/dev/hyper-io-notification-N-net`. A network-only
+client uses this route for memory admission and retirement; it has no hidden
+storage notification or LIO target. Native client 0 cannot request networking.
