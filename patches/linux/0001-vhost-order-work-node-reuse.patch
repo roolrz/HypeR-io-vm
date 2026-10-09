@@ -1,0 +1,49 @@
+Subject: [PATCH] vhost: release queued work after saving the next node
+
+The safe llist iterator saves work->node.next before executing the loop body
+in C, but clear_bit() does not order that load. On AArch64 GCC 15.2 the
+compiled worker clears VHOST_WORK_QUEUED before loading the next pointer.
+A concurrent producer can then requeue the current node and overwrite its
+next pointer, losing the rest of the detached batch. Lost work remains
+marked queued and subsequent notifications cannot enqueue it again.
+
+Use release semantics in both task and kthread workers. This orders the
+iterator load before a producer can acquire the cleared bit and reuse the
+node. It does not change the virtio feature or eventfd contracts.
+
+The missing ordering was also discussed upstream:
+https://lists.openwall.net/linux-kernel/2023/06/05/811
+
+Locally reproduced by pausing the real AArch64 worker after its flag clear
+and simulating one valid producer requeue. The original worker loses the
+following TX work; with this patch the same interleaving executes both.
+Physical RPi5 recovery has not yet been verified.
+
+--- a/drivers/vhost/vhost.c
++++ b/drivers/vhost/vhost.c
+@@ -422,7 +422,11 @@
+ 		/* make sure flag is seen after deletion */
+ 		smp_wmb();
+ 		llist_for_each_entry_safe(work, work_next, node, node) {
+-			clear_bit(VHOST_WORK_QUEUED, &work->flags);
++			/* Requeueing may overwrite node.next as soon as the bit
++			 * clears. Order the iterator's load of work_next before
++			 * releasing the node to vhost_worker_queue().
++			 */
++			clear_bit_unlock(VHOST_WORK_QUEUED, &work->flags);
+ 			__set_current_state(TASK_RUNNING);
+ 			kcov_remote_start_common(worker->kcov_handle);
+ 			work->fn(work);
+@@ -449,7 +453,11 @@
+ 		/* make sure flag is seen after deletion */
+ 		smp_wmb();
+ 		llist_for_each_entry_safe(work, work_next, node, node) {
+-			clear_bit(VHOST_WORK_QUEUED, &work->flags);
++			/* Requeueing may overwrite node.next as soon as the bit
++			 * clears. Order the iterator's load of work_next before
++			 * releasing the node to vhost_worker_queue().
++			 */
++			clear_bit_unlock(VHOST_WORK_QUEUED, &work->flags);
+ 			kcov_remote_start_common(worker->kcov_handle);
+ 			work->fn(work);
+ 			kcov_remote_stop();

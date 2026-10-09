@@ -8,7 +8,12 @@ virtio-net guest networking backends. This repository
 owns Linux builds, external drivers, Linux-side services, complete initramfs
 assembly, tests, and GHCR package publication. HypeR owns Native apps and DTS.
 
-Linux is pinned to upstream **6.18.51 LTS** without source patches.
+Linux is pinned to upstream **6.18.51 LTS** with a focused vhost work-queue
+ordering fix in `patches/linux/`. It prevents concurrent requeueing from
+losing work on AArch64; it changes neither virtio features nor device drivers.
+The build records each patch hash and includes the patches in corresponding
+sources. Patch revisions use separate extracted source trees, so cached and
+concurrent builds cannot silently share different kernel source contents.
 Hyper-specific drivers build as external `.ko` modules.
 
 At boot, the appliance prints its own Git revision (12 hexadecimal digits),
@@ -22,7 +27,7 @@ appliance banner. The upstream Linux release and module ABI remain unchanged.
 ## Build
 
 On Linux, install a C toolchain with static linking support, GNU make,
-Python 3.12+, bison, flex, bc, Perl, OpenSSL/libelf development headers, and kmod.
+Python 3.12+, patch, bison, flex, bc, Perl, OpenSSL/libelf development headers, and kmod.
 
 ```sh
 make fetch

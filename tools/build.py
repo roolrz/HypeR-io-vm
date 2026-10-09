@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: 2026 roolrz
 # SPDX-License-Identifier: Apache-2.0
 
-"""Build a pinned, unmodified upstream Linux kernel and minimal base initramfs."""
+"""Build a pinned upstream Linux kernel with recorded fixes and a minimal base initramfs."""
 
 import argparse
 from datetime import datetime, timezone
+import errno
 import gzip
 import hashlib
 import importlib.util
@@ -64,11 +65,19 @@ def fetch(component, cache):
     return destination
 
 
-def unpack(archive, component, sources, name):
-    destination = sources / f"{name}-{component['version']}"
+def unpack(archive, component, sources, name, patches=()):
+    # Never patch an already shared source tree. Each patch series gets its own
+    # immutable extraction, so concurrent board builds and cache reuse agree.
+    source_name = f"{name}-{component['version']}"
+    identity = component["sha256"]
+    if patches:
+        identity = hashlib.sha256(json.dumps(
+            [identity, [(p.name, digest(p)) for p in patches]],
+            separators=(",", ":")).encode()).hexdigest()
+    destination = sources / (source_name + ("-" + identity if patches else ""))
     stamp = destination / ".hyper-source-sha256"
     if destination.exists():
-        if stamp.read_text().strip() != component["sha256"]:
+        if stamp.read_text().strip() != identity:
             raise ValueError(f"source identity changed at {destination}; select a new output directory")
         return destination
     sources.mkdir(parents=True, exist_ok=True)
@@ -76,9 +85,17 @@ def unpack(archive, component, sources, name):
         staging = Path(temporary)
         with tarfile.open(archive) as source:
             source.extractall(staging, filter="data")
-        expanded = staging / destination.name
-        (expanded / ".hyper-source-sha256").write_text(component["sha256"] + "\n")
-        expanded.replace(destination)
+        expanded = staging / source_name
+        for fix in patches:
+            run(["patch", "--batch", "--fuzz=0", "-p1", "-i", str(fix.resolve())], cwd=expanded)
+        (expanded / ".hyper-source-sha256").write_text(identity + "\n")
+        try:
+            expanded.replace(destination)
+        except OSError as error:
+            # Another board build may have published the same complete tree.
+            if (error.errno not in (errno.EEXIST, errno.ENOTEMPTY) or
+                    not stamp.is_file() or stamp.read_text().strip() != identity):
+                raise
     return destination
 
 
@@ -110,7 +127,7 @@ def check_config(requested, actual):
 def source_bundle(output, build, linux_output, busybox_output, module_checkout):
     """Retain exact upstream archives and all local build inputs beside binaries."""
     paths = []
-    for directory in ("configs", "include", "modules", "service", "rootfs", "tools", "scripts", "tests", "LICENSES"):
+    for directory in ("configs", "include", "modules", "service", "rootfs", "tools", "scripts", "tests", "patches", "LICENSES"):
         origin = module_checkout if directory in ("include", "modules") else ROOT
         paths.extend((path, "hyper-io-vm/" + str(path.relative_to(origin)))
                      for path in sorted((origin / directory).rglob("*"))
@@ -150,9 +167,11 @@ def main():
         parser.error("invalid pinned Linux LTS identity")
     output = args.output.resolve()
     sources = {}
+    linux_patches = tuple(sorted((ROOT / "patches/linux").glob("*.patch")))
     for name in ("linux", "busybox"):
         archive = fetch(lock[name], output / "downloads")
-        sources[name] = unpack(archive, lock[name], output / "sources", name)
+        sources[name] = unpack(archive, lock[name], output / "sources", name,
+                               linux_patches if name == "linux" else ())
     if args.fetch_only:
         return
     if platform.system() != "Linux":
@@ -178,7 +197,8 @@ def main():
     profile = build / "linux.requested.config"
     ARCHIVE.publish(profile, requested.encode())
     state = linux_output / ".hyper-config-input"
-    identity = hashlib.sha256((requested + args.cross_compile + compiler_identity + lock["linux"]["sha256"]).encode()).hexdigest()
+    identity = hashlib.sha256((requested + args.cross_compile + compiler_identity +
+                               (sources["linux"] / ".hyper-source-sha256").read_text()).encode()).hexdigest()
     if not state.exists() or state.read_text() != identity:
         run(linux_make + [f"KCONFIG_ALLCONFIG={profile}", "allnoconfig"], env=environment)
         check_config(requested, linux_output / ".config")
@@ -204,6 +224,7 @@ def main():
                  "service/hyper-networks.c", "include/hyper_network.h", "service/hyper-volumes.c", "service/hyper-io-supervisor.c", "include/hyper_io_session.h", "include/hyper_io_layout.h", "tests/io-vm/business-disk.c", "sources.lock.json",
                  "configs/linux-aarch64.config", "configs/busybox.config", "LICENSE", "LICENSES/GPL-2.0-only.txt"):
         input_hashes[name] = digest(ROOT / name)
+    input_hashes.update({str(fix.relative_to(ROOT)): digest(fix) for fix in linux_patches})
     if args.platform == "rpi5":
         input_hashes["configs/linux-rpi5.config"] = digest(ROOT / "configs/linux-rpi5.config")
     modules = []

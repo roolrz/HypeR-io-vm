@@ -6,10 +6,13 @@
 
 import gzip
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import stat
+import subprocess
+import tarfile
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -51,6 +54,40 @@ class BuildVersion(unittest.TestCase):
             with self.subTest(epoch=epoch), patch.dict(os.environ, {"SOURCE_DATE_EPOCH": epoch}):
                 with self.assertRaises(ValueError):
                     BUILD.build_timestamp()
+
+
+class KernelSources(unittest.TestCase):
+    def test_patch_revision_gets_separate_sources_and_failed_patch_is_not_cached(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / "linux.tar"
+            with tarfile.open(archive, "w") as output:
+                entry = tarfile.TarInfo("linux-1/file")
+                entry.size = len(b"original\n")
+                output.addfile(entry, io.BytesIO(b"original\n"))
+            component = {"version": "1", "sha256": BUILD.digest(archive)}
+            cache = root / "sources"
+            original = BUILD.unpack(archive, component, cache, "linux")
+            fix = root / "fix.patch"
+
+            def write_fix(before, after):
+                fix.write_text(f"--- a/file\n+++ b/file\n@@ -1 +1 @@\n-{before}\n+{after}\n")
+
+            write_fix("original", "fixed")
+            first = BUILD.unpack(archive, component, cache, "linux", (fix,))
+            self.assertEqual((first / "file").read_text(), "fixed\n")
+            self.assertEqual(BUILD.unpack(archive, component, cache, "linux", (fix,)), first)
+            write_fix("original", "second fix")
+            second = BUILD.unpack(archive, component, cache, "linux", (fix,))
+            self.assertNotEqual(first, second)
+            self.assertEqual((second / "file").read_text(), "second fix\n")
+            self.assertEqual((first / "file").read_text(), "fixed\n")
+            self.assertEqual((original / "file").read_text(), "original\n")
+            before = set(cache.iterdir())
+            write_fix("does not match", "broken")
+            with self.assertRaises(subprocess.CalledProcessError):
+                BUILD.unpack(archive, component, cache, "linux", (fix,))
+            self.assertEqual(set(cache.iterdir()), before)
 
 
 class Archives(unittest.TestCase):
