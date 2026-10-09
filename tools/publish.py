@@ -29,6 +29,7 @@ REQUIRED_SOURCES = {
     'modules/guest-memory/granules.h', 'modules/io-bridge/Makefile',
     'modules/io-bridge/hyper_io_bridge.c', 'service/hyper-io-service.c',
     'tests/io-vm/business-disk.c', 'sources.lock.json',
+    'patches/linux/0001-vhost-order-work-node-reuse.patch',
     'configs/linux-aarch64.config', 'configs/busybox.config', 'LICENSE', 'LICENSES/GPL-2.0-only.txt',
 }
 

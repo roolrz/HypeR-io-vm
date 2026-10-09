@@ -19,5 +19,14 @@ jobs:
           python3 -B tools/build.py --help
           python3 -B tools/publish.py --help
           python3 -B tests/io-vm/verify.py --help
+          python3 -B tests/io-vm/tap-offload.py --help
+      - name: Check control, retirement and network activation
+        run: |
+          for test in control retirement network; do
+            cc -O2 -Wall -Wextra -Werror -Iinclude "tests/io-vm/$test.c" -o "/tmp/hyper-$test-test"
+            "/tmp/hyper-$test-test"
+          done
       - name: Compile the Linux vhost-scsi acceptance fixture
         run: cc -static -O2 -Wall -Wextra -Werror tests/io-vm/vhost-scsi.c -o /tmp/vhost-scsi-test
+      - name: Compile the Linux TAP offload acceptance fixture
+        run: cc -static -O2 -Wall -Wextra -Werror tests/io-vm/tap-offload.c -o /tmp/tap-offload-test

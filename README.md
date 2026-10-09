@@ -8,7 +8,12 @@ virtio-net guest networking backends. This repository
 owns Linux builds, external drivers, Linux-side services, complete initramfs
 assembly, tests, and GHCR package publication. HypeR owns Native apps and DTS.
 
-Linux is pinned to upstream **6.18.51 LTS** without source patches.
+Linux is pinned to upstream **6.18.51 LTS** with a focused vhost work-queue
+ordering fix in `patches/linux/`. It prevents concurrent requeueing from
+losing work on AArch64; it changes neither virtio features nor device drivers.
+The build records each patch hash and includes the patches in corresponding
+sources. Patch revisions use separate extracted source trees, so cached and
+concurrent builds cannot silently share different kernel source contents.
 Hyper-specific drivers build as external `.ko` modules.
 
 At boot, the appliance prints its own Git revision (12 hexadecimal digits),
@@ -22,7 +27,7 @@ appliance banner. The upstream Linux release and module ABI remain unchanged.
 ## Build
 
 On Linux, install a C toolchain with static linking support, GNU make,
-Python 3.12+, bison, flex, bc, Perl, OpenSSL/libelf development headers, and kmod.
+Python 3.12+, patch, bison, flex, bc, Perl, OpenSSL/libelf development headers, and kmod.
 
 ```sh
 make fetch
@@ -275,17 +280,36 @@ external connectivity or a guest DHCP lease.
 
 A configured business client owns one nonpersistent TAP, attached only when
 its virtio-net device activates. `vhost-net` serves RX queue 0 and TX queue 1.
-The frontend offers modern virtio and a fixed locally administered MAC; checksum
-and segmentation offloads, mergeable RX buffers, control queues and multiqueue
-are not offered. The MTU is 1500. This is a shared Ethernet segment, not a network
-isolation or anti-spoofing policy.
+NETWORK_HELLO advertises modern virtio, a fixed locally administered MAC, guest
+TX checksum completion (`VIRTIO_NET_F_CSUM`) and TCPv4/TCPv6 segmentation
+(`VIRTIO_NET_F_HOST_TSO4/HOST_TSO6`). Both sides must negotiate these features;
+TSO without CSUM is rejected before allocating activation resources. Older
+frontends may still select VERSION_1 and MAC only. RX offloads, mergeable RX
+buffers, control queues and multiqueue are not offered. The MTU is 1500 and each
+of the two queues remains limited to 128 descriptors. This is a shared Ethernet
+segment, not a network isolation or anti-spoofing policy.
 
-The TAP carries Ethernet frames without a virtio header. vhost's private
-`VHOST_NET_F_VIRTIO_NET_HDR` feature supplies/consumes the modern 12-byte header;
-this backend-only feature is never offered to guests. Device reset drains only
-that device. `RELEASE_MEMORY` drains both devices before unmapping RAM and
-acknowledging the grant's retirement. Failure of either drain retains the mapping
-and withholds the retirement proof.
+TAP uses `IFF_VNET_HDR` with the modern 12-byte, little-endian virtio header,
+even without mergeable RX buffers. Its configuration is probed before HELLO
+and checked again before attaching either vhost queue. vhost's private
+`VHOST_NET_F_VIRTIO_NET_HDR` stays clear so guest TX metadata reaches TAP intact;
+CSUM/TSO bits are TAP capabilities, not VHOST_SET_FEATURES bits. Linux converts
+the header to checksum/GSO state and uses software segmentation if the uplink
+does not provide hardware offload. `TUNSETOFFLOAD` remains zero because it
+controls Linux-to-guest traffic: guest RX must still receive completed checksums
+and ordinary MTU-sized frames. The control protocol layout remains version 3.
+
+Linux-side tests cover feature dependency rejection, TAP setup failures and
+partial queue attachment rollback. A fixture on each pinned kernel profile
+bridges two TAPs with receive offloads disabled, checking TCPv4/TCPv6 checksum
+completion, segmentation sizes, sequence numbers and payload bytes, plus malformed
+GSO rejection. HypeR's cross-VM acceptance additionally verifies bidirectional
+HTTP payloads, reset/rebind and stop/start. These tests have no performance
+thresholds.
+
+Device reset drains only that device. `RELEASE_MEMORY` drains both devices before
+unmapping RAM and acknowledging the grant's retirement. Failure of either drain
+retains the mapping and withholds the retirement proof.
 
 Network notifications carry `hyper,device-kind = "network"` beside
 `hyper,client-id`, producing `/dev/hyper-io-notification-N-net`. A network-only

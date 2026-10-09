@@ -301,9 +301,7 @@ int main(int argc, char **argv)
 			return 1;
 		b.net.notification = open(argv[7], O_RDWR | O_CLOEXEC);
 		if (b.net.notification < 0 ||
-		    probe_backend("/dev/vhost-net",
-				  VERSION_1 | (UINT64_C(1)
-					       << VHOST_NET_F_VIRTIO_NET_HDR)))
+		    probe_backend("/dev/vhost-net", VERSION_1) || probe_network(&b))
 			return 1;
 		b.network = 1;
 	}
