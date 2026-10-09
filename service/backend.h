@@ -4,10 +4,15 @@
 #define HYPER_BACKEND_H
 #include "hyper_io.h"
 #include <linux/vhost.h>
+#include <linux/virtio_net.h>
 #include <stdint.h>
 #define VERSION_1 (UINT64_C(1) << 32)
 #define NETWORK_MAC (UINT64_C(1) << 5)
-#define NETWORK_FEATURES (VERSION_1 | NETWORK_MAC)
+#define NETWORK_CSUM (UINT64_C(1) << VIRTIO_NET_F_CSUM)
+#define NETWORK_TSO \
+	((UINT64_C(1) << VIRTIO_NET_F_HOST_TSO4) | \
+	 (UINT64_C(1) << VIRTIO_NET_F_HOST_TSO6))
+#define NETWORK_FEATURES (VERSION_1 | NETWORK_MAC | NETWORK_CSUM | NETWORK_TSO)
 struct endpoint {
 	int notification, fd;
 	int kick[HYPER_IO_QUEUES], call[HYPER_IO_QUEUES];
@@ -47,5 +52,6 @@ int configure_vhost(struct backend *, struct endpoint *, const char *, uint32_t,
 int activate_disk(struct backend *, const struct hyper_io_activate *);
 int activate_network(struct backend *,
 		     const struct hyper_io_network_activate *);
+int probe_network(struct backend *);
 int network_bridge(const char *, const char *, char[16]);
 #endif

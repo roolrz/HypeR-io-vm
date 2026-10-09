@@ -140,6 +140,8 @@ static void network_only_session(void)
 		ssize_t size = read(sockets[0], &reply, sizeof(reply));
 		assert(size == (i == 1 ? 80 : 48));
 		assert(le32toh(reply.common.status) == statuses[i]);
+		if (i == 1)
+			assert(le64toh(reply.common.features) == NETWORK_FEATURES);
 	}
 	close(sockets[0]);
 	int status;

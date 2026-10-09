@@ -33,21 +33,53 @@ int quiesce_network(struct backend *b)
 	}
 	return 0;
 }
-static int create_tap(struct backend *b)
+/* TAP owns the modern, little-endian virtio header in both directions. The
+ * guest TX checksum/GSO metadata reaches Linux intact, even when the physical
+ * uplink needs software segmentation. TAP offloads describe the opposite
+ * direction (Linux -> guest): leave them disabled because guest RX offloads
+ * are not offered. MTU and receive buffer requirements therefore stay fixed. */
+static int open_tap(struct backend *b, struct ifreq *tap)
 {
 	b->tap = open("/dev/net/tun", O_RDWR | O_CLOEXEC);
 	if (b->tap < 0) {
 		backend_error(b, "/dev/net/tun", "open", -1);
 		return -1;
 	}
-	/* vhost supplies/consumes the virtio header. TAP carries Ethernet only;
-	 * no offload or mergeable buffers are negotiated with the guest. */
-	struct ifreq tap = {.ifr_flags = IFF_TAP | IFF_NO_PI};
-	memcpy(tap.ifr_name, "htap%d", 7);
-	if (ioctl(b->tap, TUNSETIFF, &tap)) {
+	*tap = (struct ifreq){.ifr_flags = IFF_TAP | IFF_NO_PI | IFF_VNET_HDR};
+	memcpy(tap->ifr_name, "htap%d", 7);
+	if (ioctl(b->tap, TUNSETIFF, tap)) {
 		backend_error(b, "/dev/net/tun", "TUNSETIFF", -1);
 		return -1;
 	}
+	int header_size = sizeof(struct virtio_net_hdr_v1);
+	int little_endian = 1;
+	if (ioctl(b->tap, TUNSETVNETHDRSZ, &header_size) ||
+	    ioctl(b->tap, TUNSETVNETLE, &little_endian) ||
+	    ioctl(b->tap, TUNSETOFFLOAD, 0UL)) {
+		backend_error(b, tap->ifr_name, "virtio header configuration", -1);
+		return -1;
+	}
+	return 0;
+}
+
+int probe_network(struct backend *b)
+{
+	/* Verify the complete TAP contract before HELLO advertises offloads. The
+	 * probe is never attached to a bridge and has no packet producers. */
+	struct ifreq tap;
+	int result = open_tap(b, &tap);
+	if (b->tap >= 0) {
+		close(b->tap);
+		b->tap = -1;
+	}
+	return result;
+}
+
+static int create_tap(struct backend *b)
+{
+	struct ifreq tap;
+	if (open_tap(b, &tap))
+		return -1;
 	unsigned index = if_nametoindex(tap.ifr_name);
 	if (!index) {
 		backend_error(b, tap.ifr_name, "if_nametoindex", -1);
@@ -84,12 +116,15 @@ int activate_network(struct backend *b,
 	uint64_t features = le64toh(request->features);
 	if (!b->network)
 		return HYPER_IO_UNSUPPORTED;
-	if (!(features & VERSION_1) || (features & ~NETWORK_FEATURES))
+	if (!(features & VERSION_1) || (features & ~NETWORK_FEATURES) ||
+	    ((features & NETWORK_TSO) && !(features & NETWORK_CSUM)))
 		return HYPER_IO_INVALID;
 	if (b->net.fd >= 0 || b->net.bound || b->tap >= 0)
 		return HYPER_IO_BUSY;
-	uint64_t backend_features =
-	    VERSION_1 | (UINT64_C(1) << VHOST_NET_F_VIRTIO_NET_HDR);
+	/* CSUM/TSO are TAP capabilities, not VHOST_SET_FEATURES bits. In
+	 * particular, VHOST_NET_F_VIRTIO_NET_HDR must stay clear: asking vhost
+	 * to consume the header would discard the guest's offload metadata. */
+	uint64_t backend_features = VERSION_1;
 	int status = configure_vhost(
 	    b, &b->net, "/dev/vhost-net",
 	    (uint32_t)le64toh(request->header.epoch), backend_features,

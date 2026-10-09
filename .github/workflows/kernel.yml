@@ -57,11 +57,26 @@ jobs:
           /tmp/hyper-control-test
           gcc -O2 -Wall -Wextra -Werror -Iinclude tests/io-vm/retirement.c -o /tmp/hyper-retirement-test
           /tmp/hyper-retirement-test
+          gcc -O2 -Wall -Wextra -Werror -Iinclude tests/io-vm/network.c -o /tmp/hyper-network-test
+          /tmp/hyper-network-test
       - name: Build the pinned upstream kernel, BusyBox, and external module
         id: kernel-build
         run: make base PLATFORM=${{ matrix.platform }} CROSS_COMPILE=aarch64-linux-gnu- JOBS=4
       - name: Exercise managed setup with the packaged BusyBox
         run: python3 -B tests/build/managed-shell.py target/io-vm/build/${{ matrix.platform }}/busybox/busybox
+      - name: Verify TAP checksum and segmentation fallback
+        run: |
+          aarch64-linux-gnu-gcc -static -O2 -Wall -Wextra -Werror tests/io-vm/tap-offload.c -o target/io-vm/tap-offload-test
+          python3 - <<'PYTHON'
+          import json
+          import subprocess
+          from pathlib import Path
+          base = json.loads(Path('target/io-vm/${{ matrix.platform }}-base.json').read_text())
+          subprocess.run(['python3', '-B', 'tests/io-vm/tap-offload.py',
+                          '--base', base['directory'], '--manifest-sha256', base['manifest_sha256'],
+                          '--test-binary', 'target/io-vm/tap-offload-test',
+                          '--log', 'target/io-vm/tap-offload.log'], check=True)
+          PYTHON
       - name: Boot the complete business appliance
         run: |
           python3 - <<'PYTHON'
@@ -116,6 +131,7 @@ jobs:
             target/io-vm/business.log
             target/io-vm/bringup.log
             target/io-vm/business-hold.log
+            target/io-vm/tap-offload.log
           if-no-files-found: ignore
       - name: Retain build inputs for Hyper integration
         if: always() && steps.kernel-build.outcome == 'success'
